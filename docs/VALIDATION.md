@@ -1,61 +1,72 @@
-# Validación del port
+# Port Validation
 
-## Resultados locales
+## Recorded local results
 
-Verificado en Windows x64 con Rust/Cargo 1.98.1 y MSVC:
+The implementation was checked on Windows x64 with Rust/Cargo 1.98.1 and MSVC:
 
-| Comprobación | Resultado |
+| Check | Result |
 | --- | --- |
-| Compilación Release de EXE y DLL | Correcta, sin conflicto de CRT ni colisión de nombres PDB |
-| Clippy con `-D warnings` | Correcto |
-| Pruebas Rust | 13 de biblioteca y 5 del ejecutable aprobadas; 3 adicionales de módulos compartidos en el ejemplo |
-| Comparación histórica con el C++ original | Aserciones ABI y vectores de hashes comprobados antes de retirar las fuentes antiguas |
-| API de DLL | Se conservan los seis exports originales; se añade `T7PatchStart` para el ejecutable |
-| Ejemplo `smoke` con la DLL Release | Carga, llamadas y rechazo de host desconocido correctos |
-| Carga remota en un proceso auxiliar propio | DLL cargada, respuesta `UNSUPPORTED` recibida y módulo existente reconocido en una segunda conexión |
-| Ventana Win32 | Creación de controles, bucle de mensajes y cierre comprobados; captura visual revisada |
-| BO3 en Windows | Pendiente |
-| Wine/Proton | Pendiente |
+| Release EXE and DLL build | Passed; no CRT conflict or PDB filename collision |
+| Clippy with `-D warnings` | Passed |
+| Rust tests | 13 library tests and 5 launcher tests passed, plus 3 shared-module tests in the example |
+| Historical comparison with the original C++ | ABI assertions and hash vectors verified before removing legacy sources |
+| DLL API | Six original exports retained; `T7PatchStart` added for the launcher |
+| `smoke` example with the Release DLL | Loading, API calls, and unknown-host rejection passed |
+| Remote loading into a dedicated test process | DLL loaded, `UNSUPPORTED` reply received, and existing module recognized on a second connection |
+| Win32 window | Control creation, message loop, and closing checked; screenshot visually reviewed |
+| BO3 on Windows | Pending |
+| Linux / Wine / Proton | Pending |
 
-## Pruebas automáticas
+These results describe the implementation checks, not successful in-game validation. Platform setup instructions are in the [README](../README.md#windows-setup).
 
-- Huellas PE de las dos versiones y límites de traducción RVA.
-- Tamaños, alineación y offsets de estructuras de mensajes, sesión y Steam.
-- Hashes de 32/64 bits y FNV contra vectores obtenidos compilando el C++ suministrado.
-- Configuración CRLF, límites de nombre, contraseñas vacías y última línea sin salto.
-- Guardado y reemplazo de configuración con ruta Unicode; conservación del archivo anterior cuando una edición es inválida.
-- Layout del mensaje de inicio, respuesta acotada y rechazo de versiones/argumentos incorrectos.
-- Lectura de exports PE64; rechazo de tablas inválidas, exports reenviados y ordinales fuera de rango.
-- Directivas de localización mal formadas y límites de claves de modelos UI.
-- Límites de miembros de join y candidatos de heartbeat, incluyendo negativos, truncamientos y elementos adicionales.
-- Hook real de una función de máquina creada en el proceso de prueba: original devuelve 7, hook devuelve 42, trampoline devuelve 7, desactivación vuelve a 7.
+## Automated checks
 
-Los inspectores usan una copia del lector y almacenamiento local por llamada. Sus tests simulan la interfaz de serialización; no sustituyen una prueba del protocolo con los serializadores reales de BO3.
+- PE fingerprints for both builds and RVA translation boundaries.
+- Sizes, alignment, and offsets of message, session, and Steam structures.
+- 32-bit/64-bit hashes and FNV against vectors obtained by compiling the supplied C++.
+- CRLF configuration, name limits, empty passwords, and a final line without a newline.
+- Saving and replacing configuration at a Unicode path; preserving the previous file when an edit is invalid.
+- Startup request layout, bounded replies, and rejection of invalid versions or arguments.
+- PE64 export parsing; rejection of invalid tables, forwarded exports, and out-of-range ordinals.
+- Malformed localization directives and UI model key limits.
+- Join member and heartbeat nominee limits, including negative counts, truncation, and extra elements.
+- A real hook on a machine-code function created in the test process: the original returns 7, the hook returns 42, the trampoline returns 7, and disabling the hook restores 7.
 
-## Procedencia de los valores de referencia
+Inspectors use a copy of the reader and per-call local storage. Their tests simulate the serialization interface; they do not replace protocol tests against BO3's actual serializers. Unicode fixture values are test data, not application text.
 
-Durante la migración se compiló una herramienta auxiliar que incluía el hashing y las estructuras del C++ original. Sus aserciones `static_assert` verificaron la ABI y su salida proporcionó los vectores de hashes, incluidos bytes no ASCII.
+Run the automated checks on Windows:
 
-Las fuentes antiguas y esa herramienta se retiraron durante la limpieza del proyecto. Los vectores permanecen fijados en `src/hashing.rs`, y las comprobaciones de tamaños, alineación y offsets están en `src/structs.rs`. Ambas se ejecutan con `cargo test`; ya no hay un comando de comparación C++ en este proyecto.
+```powershell
+cargo fmt -- --check
+cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+cargo test --all-targets --locked --target x86_64-pc-windows-msvc
+```
 
-## Prueba de carga
+## Reference value provenance
+
+During migration, a helper program compiled the original C++ hashing implementation and structures. Its `static_assert` checks verified the ABI, and its output supplied hash vectors, including non-ASCII bytes.
+
+The legacy sources and helper were removed during project cleanup. The vectors remain fixed in `src/hashing.rs`; size, alignment, and offset checks are in `src/structs.rs`. Both run through `cargo test`. The project no longer includes a C++ comparison command. The original and reference repositories are listed in the [credits](../README.md#credits).
+
+## DLL loading check
 
 ```powershell
 cargo build --release --locked --target x86_64-pc-windows-msvc
 cargo run --release --locked --target x86_64-pc-windows-msvc --example smoke -- target/x86_64-pc-windows-msvc/release/t7patch.dll
 ```
 
-Comprueba `LoadLibrary`, resolución de los seis exports, nombres y contraseñas, entradas nulas, desactivación repetida y rechazo de instalación en un ejecutable ajeno a BO3.
+This checks `LoadLibrary`, resolution of the six original exports, player names and passwords, null inputs, repeated deactivation, and rejection of installation in a non-BO3 executable.
 
-Para probar **la carga** en Wine, se puede copiar `release/examples/smoke.exe` junto con `release/t7patch.dll` a una máquina con Wine, y ejecutar:
+To test **loading** under standalone Wine, copy `release/examples/smoke.exe` and `release/t7patch.dll` to the Linux machine. Substitute the actual existing test prefix and DLL path:
 
 ```sh
-wine ./smoke.exe 'Z:\ruta\absoluta\t7patch.dll'
+WINEPREFIX="/absolute/path/to/test-prefix" \
+  wine ./smoke.exe 'Z:\absolute\path\to\t7patch.dll'
 ```
 
-La ruta Windows debe corresponder al archivo dentro de ese prefijo. Esta prueba de carga no instala el manejador de Wine, ya que el host es deliberadamente desconocido.
+The Windows DLL path must map to the file inside that prefix. For a Proton environment, use the matching Protontricks setup described in the [Linux instructions](../README.md#linux--steam-deck-setup). This smoke test does not install the Wine exception handler because its host is deliberately unrecognized.
 
-## Prueba del nuevo cargador
+## Launcher loading check
 
 ```powershell
 cargo build --release --locked --target x86_64-pc-windows-msvc
@@ -63,52 +74,54 @@ cargo build --release --locked --target x86_64-pc-windows-msvc --examples
 .\target\x86_64-pc-windows-msvc\release\examples\loader_smoke.exe
 ```
 
-`loader_smoke` crea su propio proceso `launcher_host.exe`, carga la DLL en él con el mecanismo real y espera una respuesta explícita de ejecutable no compatible. Repite la conexión para comprobar que reconoce el módulo ya cargado. El proceso auxiliar se cierra al terminar. Esta prueba no busca ni modifica BO3.
+`loader_smoke` creates its own `launcher_host.exe` process, loads the DLL into it through the actual loading mechanism, and expects an explicit unsupported-executable reply. It connects again to verify recognition of the loaded module. The helper process is terminated when the test finishes. This test does not search for or modify BO3.
 
-Para comprobar la ventana sin activar la detección del juego ni guardar ajustes:
+## UI check
+
+To check the window with game detection and settings writes disabled:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
 .\dist\t7patch.exe --ui-smoke-test
 ```
 
-La ventana se cierra sola tras aproximadamente dos segundos. Para obtener una captura recortada a esa ventana de prueba:
+The window closes automatically after approximately two seconds. To capture an image cropped to that test window on Windows:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\capture-ui.ps1
 ```
 
-La imagen se guarda en `target/launcher-preview.png`. Se revisó su apariencia oscura, bordes azules, campos, casilla de amigos, enlace y barra de estado.
+The image is written to `target/launcher-preview.png`. Its dark appearance, blue borders, text fields, friends-only checkbox, link, and status bar were visually reviewed.
 
-El modo de prueba de UI no demuestra la activación dentro del juego. El protocolo del lanzador sí diferencia `WAITING`, `ACTIVE`, `UNSUPPORTED`, `FAILED`, `DEACTIVATED` y `BAD_REQUEST`; la confirmación `ACTIVE` solo se emite al completar la instalación de la DLL.
+UI smoke mode does not demonstrate in-game activation. The launcher protocol distinguishes `WAITING`, `ACTIVE`, `UNSUPPORTED`, `FAILED`, `DEACTIVATED`, and `BAD_REQUEST`. `ACTIVE` is only returned once DLL installation finishes successfully.
 
-## Diferencias corregidas respecto al original
+## Corrections relative to the original
 
-- `hkLobbyMsgRW_PrepReadMsg` ahora devuelve error cuando falla la lectura o no coincide el prefijo; el original terminaba en `return true` en ambos casos.
-- La ruta de mensajes instantáneos usa los campos del `msg_t` inicializado, en lugar de interpretar los bytes del paquete como un `msg_t`.
-- Los límites de arrays rechazan cantidades negativas, elementos extra y truncamientos en listas con tamaño declarado. Los errores de serialización se propagan.
-- El índice de evento de `MenuResponseCached` se comprueba antes de acceder a la caché.
-- Las cadenas se acotan antes de copiarlas. Se admite `NULL` para borrar la contraseña y se ignoran nombres nulos.
-- Los hashes usan operaciones con desbordamiento definido, también en compilaciones Debug.
-- Hay señal de parada y espera del trabajador; la instalación y desactivación se serializan.
-- Se guardan bytes/punteros para restauración y se comprueban errores de MinHook y de escritura. Los fallos se registran mediante `OutputDebugStringA`.
-- La DLL queda fijada al proceso para conservar callbacks/trampolines todavía en ejecución. No se vuelve a instalar en ese proceso después de desactivarla.
-- La aplicación espera los objetos necesarios antes de consumir el intento de instalación. Los reintentos por arranque incompleto no se tratan como fallos definitivos.
-- EXE y DLL comparten una ruta de configuración absoluta. Cerrar la ventana detiene su trabajador de detección; la DLL ya instalada conserva su trabajador y sus hooks.
+- `hkLobbyMsgRW_PrepReadMsg` returns an error when reading fails or the prefix does not match; the original ended with `return true` in both cases.
+- The instant-message path uses fields from the initialized `msg_t` instead of interpreting packet bytes as a `msg_t`.
+- Array bounds reject negative counts, extra elements, and truncated lists with declared sizes. Serialization failures are propagated.
+- The `MenuResponseCached` event index is checked before accessing the cache.
+- Strings are bounded before copying. `NULL` clears the password, and null names are ignored.
+- Hash arithmetic has defined wrapping behavior, including in Debug builds.
+- The worker has a stop signal and is joined; installation and deactivation are serialized.
+- Original bytes and pointers are saved for restoration, and MinHook/write errors are checked. Failures are reported through `OutputDebugStringA`.
+- The DLL remains pinned to preserve callbacks and trampolines that may still be executing. Reinstallation in the same process after deactivation is not supported.
+- The launcher waits for required game objects before consuming the installation attempt. Retries during incomplete startup are not treated as permanent failures.
+- The EXE and DLL share an absolute configuration path. Closing the window stops its detection worker; the installed DLL retains its own worker and hooks.
 
-Estas correcciones cambian casos del protocolo que el C++ trataba de forma inconsistente. La interoperabilidad con otro jugador usando la versión C++ debe comprobarse, especialmente al cambiar la contraseña durante una sesión.
+These corrections affect protocol cases that the C++ handled inconsistently. Interoperability with another player using the C++ version must be checked, especially when changing the password during a session.
 
-## Pruebas que requieren BO3 — pendientes
+## Pending in-game checks
 
-Para cada ejecutable contemplado, tanto en Windows como en Wine/Proton:
+For each recognized executable, on both Windows and Wine/Proton:
 
-1. Abrir `t7patch.exe` antes de iniciar BO3. Comprobar la transición desde `No game process found.` a espera de inicialización y finalmente `Patch active`, sin errores de patrones/MinHook. Repetir abriendo la aplicación cuando el juego ya está arrancado.
-2. Entrar al menú, campaña, multijugador y Zombies. Verificar nombre, localización, modelos UI y creación de lobby.
-3. Probar invitaciones de amigos, filtro de desconocidos, chat y transición entre lobbies.
-4. Probar contraseña igual/diferente/vacía y cambio durante una sesión; comprobar los prefijos y el margen de 1500 ms del checksum anterior.
-5. Reproducir en un entorno de prueba las correcciones de crashes conocidas y verificar registros/contexto. Los hashes PE por sí solos no demuestran que cada RVA sea correcto.
-6. Desactivar durante el menú y comprobar la parada del trabajador y la restauración de las entradas modificadas. Cerrar el proceso para completar la liberación de recursos.
-7. En Wine/Proton, identificar la versión usada y verificar específicamente el camino del dispatcher. La secuencia ensamblada procede del original y depende del layout de esa versión de `ntdll`.
-8. Cambiar los campos de la ventana y comprobar su aplicación dentro del juego. Cerrar y reabrir la aplicación con BO3 activo; cerrar BO3 y volver a iniciarlo manteniendo la ventana abierta. Repetir en el mismo prefijo de Wine/Proton.
+1. Open `t7patch.exe` before starting BO3. Check the transition from `No game process found.` through initialization to `Patch active`, without integrity-pattern or MinHook errors. Repeat with the launcher opened after the game has started.
+2. Enter the menus, Campaign, Multiplayer, and Zombies. Check player names, localization, UI models, and lobby creation.
+3. Test friend invitations, unknown-user filtering, chat, and lobby transitions.
+4. Test matching, mismatched, and empty passwords, including changes during a session. Check packet prefixes and the 1500 ms grace period for the previous checksum.
+5. Reproduce known crash fixes in a test environment and inspect registers and context. A matching PE fingerprint alone does not establish that every RVA is correct.
+6. Deactivate in the menu and verify worker shutdown and restoration of modified entries. Exit the process to finish releasing resources.
+7. Record the Wine/Proton version and specifically verify the exception dispatcher path. The assembly sequence comes from the original and depends on that `ntdll` version's layout.
+8. Edit the window's fields and verify their effect in the game. Close and reopen the launcher while BO3 is running; exit and relaunch BO3 while keeping the patch window open. Repeat in the same Wine/Proton prefix.
 
-No se ha ejecutado el juego ni Wine/Proton durante la migración. No se afirma equivalencia funcional comprobada en esos entornos.
+Neither the game nor Wine/Proton has been run during this migration. Verified functional equivalence in those environments is not claimed.

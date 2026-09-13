@@ -1,83 +1,133 @@
-# T7 Patch — migración a Rust
+# T7 Patch — Rust Port
 
-Aplicación de escritorio y DLL para **Black Ops III / T7 de 64 bits**, migradas a Rust. La ventana permite cambiar nombre, contraseña y filtro de amigos, y detecta el juego para activar el parche automáticamente. MinHook continúa siendo una dependencia nativa escrita en C, utilizada mediante FFI y gestionada por Cargo.
+A Rust desktop launcher and DLL for **64-bit Black Ops III / T7**. The launcher lets you change your player name, network password, and friends-only setting, then detects the game and activates the patch automatically. MinHook remains a native C dependency, accessed through FFI and managed by Cargo.
 
-**Estado: port experimental compilable.** La interfaz y el mecanismo de carga se han comprobado localmente; la carga remota se prueba en un proceso auxiliar propio. La ejecución completa dentro de BO3 y la compatibilidad real con Wine/Proton necesitan pruebas en esos entornos.
+**Status: experimental.** The Windows UI and loading mechanism have been checked locally, including remote loading into a dedicated test process. Full operation inside BO3 and compatibility with Wine/Proton still require runtime validation.
 
-## Usar la aplicación
+## Platform support
 
-1. Mantén **`dist/t7patch.exe` y `dist/t7patch.dll` en la misma carpeta**.
-2. Abre `t7patch.exe` antes de iniciar BO3. La ventana mostrará `No game process found.`
-3. Ajusta **Change Name**, **Network Password** y **Friends Only**. Los cambios se guardan automáticamente.
-4. Inicia BO3 normalmente. La aplicación detecta `BlackOps3.exe`, carga la DLL y espera a que los objetos del juego estén disponibles.
-5. `Patch active` aparece únicamente después de recibir la confirmación de la DLL. Si el texto de un error no cabe, haz clic en la barra de estado para leerlo completo.
+| Platform | How it runs | Validation status |
+| --- | --- | --- |
+| Windows 10 or later, x64 | Windows launcher and DLL | Build, UI, and loader checks passed; in-game validation pending |
+| Linux / Steam Deck | The same Windows binaries through Wine/Proton | Setup instructions provided; runtime validation pending |
 
-El proceso se comprueba de nuevo mediante su handle antes de cargar la DLL, y su vida útil se sigue con ese handle para evitar confundir un PID reutilizado. Si cierras el juego, la aplicación vuelve a esperar al siguiente inicio. Abrir una segunda ventana trae al frente la existente.
+The current build target is `x86_64-pc-windows-msvc`. There is no native Linux executable or `.so` build. The documented build workflow runs on Windows; Linux users can copy its output and use the setup below.
 
-Cerrar la aplicación deja activo el parche que ya se instaló en el juego. Al volver a abrirla se reconoce la DLL cargada. Los fallos definitivos de instalación y la desactivación explícita requieren reiniciar BO3; el estado «juego todavía no preparado» se reintenta automáticamente.
+## Windows setup
 
-La interfaz conserva el estilo oscuro y los controles de la captura de referencia. El pie identifica al autor y `Learn more` abre el repositorio original de T7 Patch.
+### Requirements
 
-## Compilar
+- Windows 10 or later, 64-bit.
+- An installed copy of Black Ops III matching a [recognized game build](#recognized-game-builds).
+- `t7patch.exe` and `t7patch.dll` from the same build, kept together in a writable folder.
+- The [Microsoft Visual C++ x64 runtime](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist), if it is not already installed.
 
-En Windows, con Rust y Visual Studio Build Tools (C++ x64 y Windows SDK):
+### Run the patch
+
+1. Build the project using [Build from source](#build-from-source), or use a matching pair of compiled binaries.
+2. Keep **`dist/t7patch.exe` and `dist/t7patch.dll` in the same folder** and open `t7patch.exe` before starting BO3. The window displays `No game process found.`
+3. Set **Change Name**, **Network Password**, and **Friends Only**. Changes are saved automatically.
+4. Start BO3 normally. The launcher detects `BlackOps3.exe`, loads the DLL, and waits for the game's objects to become available.
+5. `Patch active` appears only after the DLL confirms successful installation. Click the status bar to read an error message that does not fit in the window.
+
+The launcher rechecks process identity through its open handle and tracks that handle to avoid confusing a reused PID with the original game process. When the game closes, it waits for the next launch. Opening a second launcher brings the existing window to the foreground.
+
+Closing the launcher leaves an already installed patch active in the game. Reopening it recognizes the loaded DLL. A permanent installation failure or explicit deactivation requires restarting BO3; a game that is still initializing is retried automatically.
+
+The UI follows the dark style and controls of the reference screenshot. Its footer credits the original author, and `Learn more` opens the original T7 Patch repository.
+
+## Linux / Steam Deck setup
+
+These instructions run the **Windows launcher and DLL through Wine/Proton**. They describe the intended setup; this port has not yet been validated inside BO3 on Linux.
+
+### Steam with Proton
+
+1. Install BO3 in Steam and select a Proton version in the game's **Properties > Compatibility** settings.
+2. Launch the game once, then close it, so Steam creates its Proton prefix. BO3's Steam App ID is **`311210`**.
+3. Copy the Windows build's `dist` folder to a writable location on Linux. Keep `t7patch.exe` and `t7patch.dll` together.
+4. Install [Protontricks](https://github.com/Matoking/protontricks) using a current distribution package or the Flatpak method below.
+5. Start the launcher in BO3's Proton environment:
+
+   ```sh
+   protontricks-launch --appid 311210 "/absolute/path/to/t7patch/t7patch.exe"
+   ```
+
+6. Leave the patch window open and start BO3 from Steam. Follow the status bar until the DLL reports `Patch active`.
+
+**The launcher and BO3 must share the same prefix, Proton version, and process environment.** Running the launcher in a separate Wine prefix or with an unrelated system Wine installation will not provide access to the game's processes. If you use a custom `STEAM_COMPAT_DATA_PATH`, use that same setting for Protontricks. See the [official Protontricks usage documentation](https://github.com/Matoking/protontricks#usage).
+
+### Protontricks Flatpak / Steam Deck
+
+On Steam Deck, perform the initial setup in **Desktop Mode**. Install Protontricks from Discover, or use the following command with Flatpak and Flathub already configured:
+
+```sh
+flatpak install flathub com.github.Matoking.protontricks
+```
+
+Launch the patch with access to its folder:
+
+```sh
+flatpak run \
+  --filesystem="/absolute/path/to/t7patch" \
+  --command=protontricks-launch \
+  com.github.Matoking.protontricks \
+  --appid 311210 "/absolute/path/to/t7patch/t7patch.exe"
+```
+
+Replace the example paths with your actual patch folder. The filesystem option grants access for this invocation, including writing `t7patch.conf`. Additional Steam libraries may also need filesystem access; follow the [Protontricks Flatpak configuration guide](https://github.com/flathub/com.github.Matoking.protontricks#configuration). You can also open the EXE with **Protontricks Launcher** in the file manager and select BO3 after configuring folder access.
+
+### Existing Wine setups
+
+If you already run BO3 using standalone Wine, launch the patch using that **same Wine installation and existing game prefix**:
+
+```sh
+WINEPREFIX="/absolute/path/to/bo3-prefix" \
+  wine "/absolute/path/to/t7patch/t7patch.exe"
+```
+
+This is for an existing standalone Wine setup, not a replacement for the Steam/Proton instructions. The Visual C++ x64 runtime must be available in the selected prefix.
+
+### Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| `No game process found.` while BO3 is running | On Linux, check the prefix, Proton version, and process environment. On Windows, check that the process is `BlackOps3.exe` and both programs have compatible permissions. |
+| Missing `VCRUNTIME140.dll` or DLL loading failure | Keep the EXE and DLL from the same build together and install the x64 Visual C++ runtime. Under Wine/Proton, install it inside BO3's prefix. |
+| Settings cannot be read or saved | Use a writable patch folder. With Flatpak, grant access to that folder. |
+| Waiting for game initialization | Allow BO3 to finish starting. If it never becomes ready, capture the status and game build details for investigation. |
+| Unsupported executable, integrity pattern mismatch, or a permanent installation error | Check the recognized build fingerprints and read the full status message. A failed installation attempt requires restarting BO3. |
+
+## Build from source
+
+On Windows, install Rust with the MSVC toolchain and Visual Studio Build Tools with **Desktop development with C++**, x64 build tools, and a Windows SDK. From the repository root, run:
 
 ```powershell
+rustup target add x86_64-pc-windows-msvc
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```
 
-Salida:
+Output:
 
 ```text
 dist/t7patch.exe
 dist/t7patch.dll
 ```
 
-El script compila y copia los dos binarios sin sobrescribir `t7patch.conf`. La opción de PowerShell afecta solo al proceso que ejecuta ese script. También puedes compilar directamente:
+The script builds and copies both binaries without overwriting `t7patch.conf`. The PowerShell execution policy option applies only to that script's process. You can also build directly:
 
 ```powershell
 cargo build --release --locked --target x86_64-pc-windows-msvc
 ```
 
-Cargo genera `target/x86_64-pc-windows-msvc/release/t7patch-launcher.exe` y `t7patch.dll`. El ejecutable se llama `t7patch-launcher` dentro de Cargo para evitar colisiones de archivos PDB con la biblioteca; la distribución lo presenta como `t7patch.exe`.
+Cargo produces `target/x86_64-pc-windows-msvc/release/t7patch-launcher.exe` and `t7patch.dll`. The Cargo binary target is named `t7patch-launcher` to avoid PDB filename collisions with the library; the distribution script names it `t7patch.exe`.
 
-Cargo descarga las dependencias indicadas en `Cargo.lock` y compila MinHook a través de `minhook-sys`, con el runtime correspondiente a la compilación Rust. No se necesitan bibliotecas `.lib` locales ni proyectos de Visual Studio para el parche; las herramientas C++ se utilizan para compilar la dependencia MinHook.
+Cargo downloads the dependencies recorded in `Cargo.lock` and builds MinHook through `minhook-sys` with the matching runtime. The patch does not require local prebuilt `.lib` files or a Visual Studio project; the C++ build tools compile the MinHook dependency.
 
-## Integración con el cargador
+Linux execution uses these same build outputs. Native Linux compilation and a Linux-hosted cross-compilation workflow are not configured in this repository.
 
-La DLL conserva los seis exports de la API original:
+## Configuration
 
-| Export | Función |
-| --- | --- |
-| `EnableInjectorlessInstall()` | Habilita la configuración por archivo; ya está activada de forma predeterminada en el original y en este port. |
-| `zbr_run_gamemode_lui(input)` | Instala el parche si el hash de `input` coincide con `serious_anticrash_2023`. |
-| `SetFriendsOnly(bool)` | Cambia el filtro de amigos. |
-| `SetPlayerName(const char*)` | Cambia el nombre; admite hasta 15 bytes. |
-| `SetNetworkPassword(const char*)` | Configura la contraseña de red; una cadena vacía o `NULL` la desactiva. |
-| `Unload()` | Detiene el trabajador, deshabilita hooks y restaura las modificaciones registradas. |
-
-Además, `T7PatchStart(void*)` implementa la API v1 del nuevo ejecutable: recibe una estructura sin punteros internos, con ruta UTF-16 absoluta del archivo de configuración, y devuelve el estado y un mensaje. Su firma es compatible con un punto de entrada de hilo Windows x64. Declaraciones C/C++: [`include/t7patch.h`](include/t7patch.h).
-
-`DllMain` no instala el parche automáticamente. El nuevo ejecutable utiliza `LoadLibraryW` dentro del proceso de BO3 y después `T7PatchStart`, **fuera de `DllMain`**. Resuelve la dirección remota del módulo que contiene `LoadLibraryW` y el RVA del export de la DLL, sin asumir bases de módulos iguales entre procesos. Consulta el estado aproximadamente cada dos segundos.
-
-Los cargadores anteriores pueden seguir usando `zbr_run_gamemode_lui` cuando Steam y el lobby estén listos. Una llamada temprana se limita a registrar que el juego aún no está preparado: no consume el intento de instalación. Los ajustes del archivo se aplican al instalar y cuando cambia su contenido.
-
-La instalación comprueba la huella PE y las cantidades de patrones de integridad. Los errores se emiten mediante `OutputDebugStringA` con el prefijo `T7 Patch Rust:`.
-
-### Versiones contempladas
-
-`src/game_build.rs` conserva las huellas del proyecto original, sin obtener offsets nuevos:
-
-| Identificador del original | PE TimeDateStamp | SizeOfImage admitido |
-| --- | --- | --- |
-| February2026 | `0x693D731E` | `0x1D74AC00`, `0x1D74B000` |
-| September2026 | `0x6A7B6355` | `0x1D75BC00`, `0x1D75C000` |
-
-Para septiembre se aplica el desplazamiento `-0x6C0` en el intervalo RVA `[0x1D29C20, 0x2EFF000)`. Estos datos proceden del proyecto original; todavía no se han validado contra una ejecución del juego durante esta migración.
-
-## Configuración
-
-Con el nuevo ejecutable, `t7patch.conf` se crea **junto al `.exe`**. Su ruta absoluta se comunica a la DLL, aunque BO3 tenga otro directorio de trabajo. Los cargadores antiguos que no suministren esa ruta mantienen el archivo relativo al directorio de trabajo del juego:
+The new launcher creates **`t7patch.conf` next to its EXE**. It passes the absolute path to the DLL even if BO3 has a different working directory. Legacy loaders that do not provide a path retain the configuration file relative to the game's working directory:
 
 ```ini
 playername=Unknown Soldier
@@ -85,60 +135,100 @@ isfriendsonly=1
 networkpassword=
 ```
 
-La ventana guarda las ediciones tras una pausa breve al escribir; la casilla se guarda inmediatamente. La DLL comprueba el contenido aproximadamente cada segundo. La escritura publica un archivo completo mediante reemplazo, para que el lector no consuma una edición parcial. Un error de escritura o un valor inválido se muestra en la ventana y conserva el archivo anterior.
+The window saves text edits after a short typing pause and checkbox changes immediately. The DLL checks the file contents approximately once per second. Writes replace the configuration with a complete file so the reader does not consume a partial edit. Invalid values or write errors appear in the window and preserve the previous file.
 
-Se admiten finales de línea LF/CRLF, valores con `=` y una última línea sin salto de línea. Los límites son 15 bytes para el nombre y 1023 para la contraseña del archivo; no son límites de caracteres Unicode. La aplicación y el juego necesitan poder acceder a esa carpeta y tener niveles de permisos compatibles.
+The parser accepts LF/CRLF line endings, values containing `=`, and a final line without a newline. Limits are **15 bytes for the player name** and **1023 bytes for the password**, not Unicode character counts. Both programs need access to the configuration folder and compatible permission levels.
 
-Los hashes respetan el `char` con signo de MSVC y el tratamiento ASCII de mayúsculas del original, incluidos los vectores de bytes altos comprobados con su implementación C++.
+Hashing preserves MSVC's signed `char` behavior and the original ASCII case handling, including high-byte vectors checked against the C++ implementation. Non-ASCII test fixtures intentionally exercise Unicode paths and byte compatibility.
 
-## Windows y Wine/Proton
+## Loader integration
 
-Se genera **la misma DLL PE64 de Windows** para ambos. En Wine/Proton debe cargarse dentro del proceso de BO3, con el runtime Visual C++ x64 disponible en el prefijo. No se genera una biblioteca `.so`.
+The DLL preserves the six original API exports:
 
-Para la detección automática, el `.exe` y BO3 deben ejecutarse en **el mismo prefijo y entorno Wine/Proton**. Ejecutar el lanzador con un Wine o prefijo diferente no le da acceso a los procesos del juego. La compilación actual utiliza APIs de escritorio de Windows 10 o posterior.
-
-El manejador incluye:
-
-- La ruta del puntero de `KiUserExceptionDispatcher` reconocida por el original.
-- La secuencia de 27 bytes específica de Wine del código original, trasladada a `src/exceptions.rs`.
-- Un manejador vectored de Windows como alternativa para las firmas no reconocidas; el original dejaba esa alternativa como `TODO`.
-
-La ruta Wine está implementada, **pero no se ha ejecutado en Wine/Proton aquí**. Las firmas internas de `ntdll` y las llamadas a las funciones del juego requieren validación de ejecución.
-
-## Desactivación y vida útil
-
-`Unload()` es una **desactivación lógica**, no una descarga física. Se espera al trabajador antes de restaurar hooks. La DLL permanece fijada al proceso y conserva trampolines, la tabla virtual clonada y el manejador de excepciones en modo inactivo, para que las llamadas que estaban en curso no salten a código liberado. El manejador todavía reconoce el puntero centinela que otro hilo pudo haber leído antes de la restauración.
-
-Como en el original, los parches de integridad permanecen hasta cerrar el proceso tras una instalación correcta. Los nombres publicados a Steam tienen almacenamiento inmutable que permanece válido. Los nombres del jugador, la semilla modificada y los valores de dvars configurados tampoco se deshacen. Reinicia BO3 para volver a instalar después de `Unload()` o de un fallo de instalación. No se reclama una restauración completa del estado del juego.
-
-## Módulos
-
-| Funcionalidad | Módulos en `src/` |
+| Export | Purpose |
 | --- | --- |
-| Exports, ciclo de vida y excepciones | `lib.rs`, `runtime.rs`, `exceptions.rs` |
-| Aplicación y ventana Win32 | `bin/t7patch.rs`, `launcher/ui.rs` |
-| Detección, carga y estados | `launcher/mod.rs`, `launcher/process.rs`, `launcher_api.rs` |
-| Formato de configuración compartido | `settings.rs` |
-| Detección de versiones y traducción de direcciones | `game_build.rs` |
-| Hashes | `hashing.rs` |
-| Estructuras compatibles con el juego | `structs.rs` |
+| `EnableInjectorlessInstall()` | Enables file-based configuration; enabled by default in both the original and this port. |
+| `zbr_run_gamemode_lui(input)` | Requests installation if the input hash matches `serious_anticrash_2023`. |
+| `SetFriendsOnly(bool)` | Changes the friends-only filter. |
+| `SetPlayerName(const char*)` | Changes the player name; accepts up to 15 bytes. |
+| `SetNetworkPassword(const char*)` | Sets the network password; an empty string or `NULL` clears it. |
+| `Unload()` | Stops the worker, disables hooks, and restores recorded modifications. |
+
+`T7PatchStart(void*)` implements the new launcher's version 1 API. It accepts a structure without internal pointers, containing the absolute UTF-16 configuration path, and returns a status and message. Its signature is compatible with a Windows x64 thread entry point. C/C++ declarations are in [`include/t7patch.h`](include/t7patch.h).
+
+`DllMain` does not install the patch automatically. The launcher calls `LoadLibraryW` inside BO3, followed by `T7PatchStart`, **outside `DllMain`**. It resolves the remote module containing `LoadLibraryW` and the DLL export's RVA without assuming identical module bases across processes. Status is polled approximately every two seconds.
+
+Legacy loaders can still call `zbr_run_gamemode_lui` once Steam and the lobby are ready. An early call only reports that the game is not ready and does not consume the installation attempt. File settings are applied during installation and when the contents change.
+
+Installation checks the PE fingerprint and integrity pattern counts. Diagnostics use `OutputDebugStringA` with the `T7 Patch Rust:` prefix.
+
+### Recognized game builds
+
+`src/game_build.rs` retains the original project's fingerprints; no new offsets were derived:
+
+| Original identifier | PE TimeDateStamp | Accepted SizeOfImage |
+| --- | --- | --- |
+| February2026 | `0x693D731E` | `0x1D74AC00`, `0x1D74B000` |
+| September2026 | `0x6A7B6355` | `0x1D75BC00`, `0x1D75C000` |
+
+The September build uses a `-0x6C0` adjustment over the RVA interval `[0x1D29C20, 0x2EFF000)`. These values come from the original project and have not yet been validated against a running game during this migration.
+
+### Exception handling
+
+The handler includes:
+
+- The `KiUserExceptionDispatcher` pointer path recognized by the original patch.
+- The original 27-byte Wine-specific sequence, ported to `src/exceptions.rs`.
+- A Windows vectored exception handler for unrecognized dispatcher signatures; the original left this fallback as a `TODO`.
+
+The Wine path is implemented, **but has not been executed under Wine/Proton here**. Internal `ntdll` signatures and calls into game functions require runtime validation.
+
+## Deactivation and lifetime
+
+`Unload()` performs **logical deactivation**, not physical DLL unloading. It waits for the worker before restoring hooks. The DLL remains pinned to the process and retains trampolines, the cloned virtual table, and an inactive exception handler so in-flight calls do not jump into freed code. The handler still recognizes a sentinel pointer another thread may have read before restoration.
+
+As in the original, integrity patches remain until process exit after a successful installation. Names published to Steam have immutable, persistent storage. Player names, the modified seed, and configured dvar values are not reverted either. Restart BO3 to install again after `Unload()` or a failed installation. Complete restoration of game state is not claimed.
+
+## Project layout
+
+| Responsibility | Modules under `src/` |
+| --- | --- |
+| Exports, lifecycle, and exceptions | `lib.rs`, `runtime.rs`, `exceptions.rs` |
+| Desktop app and Win32 window | `bin/t7patch.rs`, `launcher/ui.rs` |
+| Detection, loading, and status | `launcher/mod.rs`, `launcher/process.rs`, `launcher_api.rs` |
+| Shared configuration format | `settings.rs` |
+| Build detection and address translation | `game_build.rs` |
+| Hashing | `hashing.rs` |
+| Game-compatible structures | `structs.rs` |
 | Hooks | `hooks.rs` |
-| Protecciones, paquetes y configuración | `protection.rs`, `packets.rs`, `config.rs` |
-| Parches de integridad | `arxan.rs` |
-| Acceso a memoria y FFI | `memory.rs`, `minhook.rs`; API de Windows mediante `windows-sys` |
+| Protections, packets, and configuration | `protection.rs`, `packets.rs`, `config.rs` |
+| Integrity patches | `arxan.rs` |
+| Memory access and FFI | `memory.rs`, `minhook.rs`; Windows APIs through `windows-sys` |
 
-Las ramas de `SPOOF_UNLOCK_ALL` y `SPOOF_SKIP_CWL` estaban desactivadas en el proyecto suministrado. Se mantiene ese comportamiento: no se instalan los hooks que únicamente reenviaban esas llamadas sin modificarlas. Los hooks de caché de nombres de script comentados en `ApplyHooks` tampoco se activan; la ruta de respuesta de menú sí valida sus índices.
+`SPOOF_UNLOCK_ALL` and `SPOOF_SKIP_CWL` were disabled in the supplied project. This port retains that behavior and omits hooks that only forwarded those calls unchanged. Script-name cache hooks that were commented out in the original `ApplyHooks` are also left disabled; the menu-response path validates its indices.
 
-## Verificar
+## Validation
+
+Run on Windows from the repository root:
 
 ```powershell
 cargo fmt -- --check
 cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
-cargo test --locked --target x86_64-pc-windows-msvc
+cargo test --all-targets --locked --target x86_64-pc-windows-msvc
 cargo build --release --locked --target x86_64-pc-windows-msvc
 cargo run --release --locked --target x86_64-pc-windows-msvc --example smoke -- target/x86_64-pc-windows-msvc/release/t7patch.dll
 ```
 
-El ejemplo `smoke` prueba la carga y los exports en un proceso que **no es BO3**; no prueba los offsets del juego. Detalles y pruebas de ejecución pendientes: [`docs/VALIDATION.md`](docs/VALIDATION.md).
+The `smoke` example checks loading and exports in a process that **is not BO3**; it does not validate game offsets. Additional loader/UI checks and pending in-game tests are documented in [`docs/VALIDATION.md`](docs/VALIDATION.md).
 
-Las fuentes C++ antiguas y la herramienta auxiliar de comparación se retiraron tras obtener los vectores de referencia. Las pruebas Rust conservan esos valores y las comprobaciones de ABI. `include/t7patch.h` describe la API para cargadores C/C++. La migración no cambia la autoría del parche original ni las licencias de sus dependencias.
+Legacy C++ sources and the comparison utility were removed after capturing reference vectors. Rust tests retain those values and ABI checks.
+
+## Credits
+
+Thanks to the authors and contributors of these projects:
+
+- **Original T7 Patch — Serious / shiversoftdev:** [shiversoftdev/t7patch](https://github.com/shiversoftdev/t7patch), the original community patch repository.
+- **Source reference — Scroptss:** [Scroptss/T7Patch-src](https://github.com/Scroptss/T7Patch-src).
+- **Related T7 Patch repository — Scroptss:** [Scroptss/T7Patch](https://github.com/Scroptss/T7Patch).
+
+The Rust port preserves credit for the original patch and reference projects. MinHook and the other dependencies retain their respective authorship and licenses.
