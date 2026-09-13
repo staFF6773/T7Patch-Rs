@@ -270,6 +270,8 @@ enum Stage {
     Loading(RemoteCall),
     Starting(RemoteCall),
     Idle(Instant),
+    Monitoring(Instant),
+    Confirmed,
     Failed,
 }
 pub struct Session {
@@ -277,6 +279,7 @@ pub struct Session {
     process: Rc<Handle>,
     dll: PathBuf,
     export: u32,
+    status_export: Option<u32>,
     base: usize,
     config: PathBuf,
     stage: Stage,
@@ -293,10 +296,9 @@ impl Session {
     ) -> Result<Self, String> {
         let dll =
             std::fs::canonicalize(dll).map_err(|e| format!("Cannot open t7patch.dll: {e}"))?;
-        let export = export_rva(
-            &std::fs::read(&dll).map_err(|e| e.to_string())?,
-            b"T7PatchStart",
-        )?;
+        let image = std::fs::read(&dll).map_err(|e| e.to_string())?;
+        let export = export_rva(&image, b"T7PatchStart")?;
+        let status_export = data_export_rva(&image, b"T7PatchStatus").ok();
         if !config.is_absolute() || wide(config).len() > 1024 {
             return Err(
                 "Configuration path must be absolute and shorter than 1024 UTF-16 units".into(),
@@ -369,6 +371,7 @@ impl Session {
                 process,
                 dll,
                 export,
+                status_export,
                 base,
                 config: config.to_owned(),
                 stage,
@@ -437,20 +440,69 @@ impl Session {
                 self.code = code;
                 self.active = code == launcher_api::ACTIVE;
                 self.status = response.text();
-                self.stage = if [launcher_api::WAITING, launcher_api::ACTIVE].contains(&code) {
-                    Stage::Idle(Instant::now() + Duration::from_secs(2))
-                } else {
-                    Stage::Failed
-                };
+                self.stage = self.after_bootstrap(code);
+            }
+            Stage::Monitoring(next) if Instant::now() >= *next => {
+                let address =
+                    self.base + self.status_export.ok_or("Missing passive status export")? as usize;
+                let mut code = 0u32;
+                let mut count = 0;
+                if unsafe {
+                    ReadProcessMemory(
+                        self.process.0,
+                        address as _,
+                        (&mut code as *mut u32).cast(),
+                        size_of::<u32>(),
+                        &mut count,
+                    )
+                } == 0
+                    || count != size_of::<u32>()
+                {
+                    return Err(error("Reading passive patch status"));
+                }
+                self.code = code;
+                self.active = code == launcher_api::ACTIVE;
+                match code {
+                    launcher_api::ACTIVE => {
+                        self.stage = Stage::Monitoring(Instant::now() + Duration::from_secs(2))
+                    }
+                    launcher_api::DEACTIVATED => {
+                        self.status = "Patch deactivated. Restart BO3 to install again.".into();
+                        self.stage = Stage::Failed;
+                    }
+                    launcher_api::FAILED => return Err("Patch failed. Restart BO3.".into()),
+                    _ => return Err(format!("Unexpected passive patch status {code}")),
+                }
             }
             _ => {}
         }
         Ok(())
     }
+
+    fn after_bootstrap(&self, code: u32) -> Stage {
+        match code {
+            launcher_api::WAITING => Stage::Idle(Instant::now() + Duration::from_secs(2)),
+            launcher_api::ACTIVE if self.status_export.is_some() => {
+                Stage::Monitoring(Instant::now() + Duration::from_secs(2))
+            }
+            // Old DLLs lack passive status: retain their confirmed state instead
+            // of repeatedly creating game threads and running DLL/TLS callbacks.
+            launcher_api::ACTIVE => Stage::Confirmed,
+            _ => Stage::Failed,
+        }
+    }
 }
 
 /// Parse the on-disk PE export table without loading the DLL in the launcher.
 pub fn export_rva(data: &[u8], name: &[u8]) -> Result<u32, String> {
+    export_location(data, name, true)
+}
+
+fn data_export_rva(data: &[u8], name: &[u8]) -> Result<u32, String> {
+    export_location(data, name, false)
+}
+
+fn export_location(data: &[u8], name: &[u8], executable: bool) -> Result<u32, String> {
     let bad = || "Invalid x64 patch DLL / export table".to_string();
     let u16_at = |offset: usize| -> Result<u16, String> {
         Ok(u16::from_le_bytes(
@@ -531,7 +583,16 @@ pub fn export_rva(data: &[u8], name: &[u8]) -> Result<u32, String> {
         for i in 0..count {
             let section = sections + i * 40;
             if let Some(delta) = rva.checked_sub(u32_at(section + 12)?) {
-                if delta < u32_at(section + 8)? && u32_at(section + 36)? & 0x20000000 != 0 {
+                let size = u32_at(section + 8)?;
+                let flags = u32_at(section + 36)?;
+                let valid = if executable {
+                    delta < size && flags & 0x20000000 != 0
+                } else {
+                    rva % 4 == 0
+                        && delta.checked_add(4).is_some_and(|end| end <= size)
+                        && flags & 0x40000000 != 0
+                };
+                if valid {
                     return Ok(rva);
                 }
             }
@@ -544,6 +605,50 @@ pub fn export_rva(data: &[u8], name: &[u8]) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn active_status_is_passive_and_observes_deactivation() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let status = AtomicU32::new(launcher_api::ACTIVE);
+        let mut session = Session {
+            pid: unsafe { GetCurrentProcessId() },
+            process: Rc::new(Handle(unsafe { GetCurrentProcess() })),
+            dll: PathBuf::new(),
+            export: 0,
+            status_export: Some(0),
+            base: std::ptr::from_ref(&status) as usize,
+            config: PathBuf::new(),
+            stage: Stage::Monitoring(Instant::now()),
+            status: "Patch active (test build)".into(),
+            active: true,
+            code: launcher_api::ACTIVE,
+        };
+        assert!(matches!(
+            session.after_bootstrap(launcher_api::WAITING),
+            Stage::Idle(_)
+        ));
+        assert!(matches!(
+            session.after_bootstrap(launcher_api::ACTIVE),
+            Stage::Monitoring(_)
+        ));
+        for _ in 0..3 {
+            session.stage = Stage::Monitoring(Instant::now());
+            session.advance().unwrap();
+            assert!(session.active);
+            assert!(matches!(session.stage, Stage::Monitoring(_)));
+            assert_eq!(session.status, "Patch active (test build)");
+        }
+        status.store(launcher_api::DEACTIVATED, Ordering::Release);
+        session.stage = Stage::Monitoring(Instant::now());
+        session.advance().unwrap();
+        assert!(!session.active);
+        assert_eq!(session.code, launcher_api::DEACTIVATED);
+        assert!(matches!(session.stage, Stage::Failed));
+        session.status_export = None;
+        assert!(matches!(
+            session.after_bootstrap(launcher_api::ACTIVE),
+            Stage::Confirmed
+        ));
+    }
     #[test]
     fn rejects_invalid_pe() {
         for bytes in [&[][..], b"MZ", &[0; 128]] {
@@ -591,5 +696,13 @@ mod tests {
         u32_at(&mut data, 0x248, 0x1200);
         u16_at(&mut data, 0x250, 1);
         assert!(export_rva(&data, b"T7PatchStart").is_err());
+        u16_at(&mut data, 0x250, 0);
+        u32_at(&mut data, section + 36, 0x40000000);
+        assert!(export_rva(&data, b"T7PatchStart").is_err());
+        assert_eq!(data_export_rva(&data, b"T7PatchStart").unwrap(), 0x1200);
+        u32_at(&mut data, 0x248, 0x1201);
+        assert!(data_export_rva(&data, b"T7PatchStart").is_err());
+        u32_at(&mut data, 0x248, 0x1600);
+        assert!(data_export_rva(&data, b"T7PatchStart").is_err());
     }
 }

@@ -1,7 +1,7 @@
 use crate::{
     config,
     game_build::address,
-    memory::{self, bounded_string, copy_string, read, store},
+    memory::{self, bounded_string, copy_string, game_string, read, store},
     minhook, packets, protection,
     structs::*,
 };
@@ -16,7 +16,10 @@ macro_rules! hook {
             use super::*;
             pub const RVA: usize = $rva;
             pub static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+            pub static METRIC: crate::profiling::Metric = crate::profiling::Metric::new(concat!("hook.", stringify!($name)));
             pub unsafe extern "C" fn detour($($arg: $ty),*) -> $ret {
+                let _pending = METRIC.track();
+                let _sample = METRIC.enter();
                 #[allow(unused_variables)]
                 let $original: unsafe extern "C" fn($($ty),*) -> $ret = std::mem::transmute(ORIGINAL.load(Ordering::Acquire));
                 $body
@@ -26,7 +29,7 @@ macro_rules! hook {
 }
 
 pub const WINDOW_TEXT: &[u8] = b"Call of Duty: Black Ops III (community patch by serious)\0";
-const VERSION: &[u8] = b"Patch 3.06 - Rust port (experimental)";
+const VERSION: &[u8] = b"T7 Patch Rust (experimental)";
 
 extern "C" {
     fn __report_gsfailure(cookie: usize);
@@ -38,6 +41,12 @@ unsafe extern "C" fn report_gsfailure(_cookie: usize) {
 
 fn valid_path(bytes: &[u8]) -> bool {
     bytes.split(|&b| b == b'.').all(|part| part.len() < 64)
+}
+// These UI callbacks receive live engine-owned strings, just as the original
+// hkUI_Model_* hooks (strlen + key-size check). Querying the address space here
+// made each model lookup take milliseconds in the reported September build.
+unsafe fn valid_game_path(path: *const c_char) -> bool {
+    game_string(path, 65536).is_some_and(valid_path)
 }
 unsafe fn key_is(key: *const c_char, expected: &[u8]) -> bool {
     bounded_string(key, 256).is_some_and(|key| key.eq_ignore_ascii_case(expected))
@@ -101,7 +110,7 @@ hook!(join_info(controller: u32, xuid: u64, arg: i64) -> i64, 0x1E724A0, |origin
 });
 
 hook!(config_string(index: i32) -> *const c_char, 0x1321130, |original| {
-    if !campaign() && [3514, 3627].contains(&index)
+    if [3514, 3627].contains(&index) && !campaign()
         && bounded_string(original(index), 65536).is_some_and(|s| s.len() >= 9 && s[..9].eq_ignore_ascii_case(b"mspreload")) {
             game_fn!(0x13667E0, unsafe extern "C" fn(i32, *const c_char) -> *const c_char)(index, c"".as_ptr());
     }
@@ -169,7 +178,7 @@ fn sanitize_binding(input: &mut [u8]) {
 hook!(binding(client: i32, translated: *const c_char, output: *mut c_char) -> *const c_char, 0x221CE90, |original| {
     if output.is_null() { return std::ptr::null(); }
     let source = if translated.is_null() { &[][..] } else {
-        let Some(source) = bounded_string(translated, 4096) else { return std::ptr::null(); }; source
+        let Some(source) = game_string(translated, 4096) else { return std::ptr::null(); }; source
     };
     let mut input = [0u8; 4096];
     input[..source.len()].copy_from_slice(source);
@@ -177,7 +186,7 @@ hook!(binding(client: i32, translated: *const c_char, output: *mut c_char) -> *c
     original(client, input.as_ptr().cast(), output)
 });
 hook!(model_string(controller: i32, element: *mut c_char, source: *const c_char, dest: *mut c_char, capacity: u32) -> bool, 0x1F27400, |original| {
-    let Some(source) = bounded_string(source, 4096) else { return false; };
+    let Some(source) = game_string(source, 4096) else { return false; };
     let mut input = [0u8; 4096];
     input[..source.len()].copy_from_slice(source);
     let mut replaced = false;
@@ -194,16 +203,16 @@ hook!(model_string(controller: i32, element: *mut c_char, source: *const c_char,
 });
 
 hook!(model_path0(parent: i64, path: *const c_char) -> i32, 0x200CF00, |original| {
-    if bounded_string(path, 65536).is_some_and(valid_path) { original(parent, path) } else { 0 }
+    if valid_game_path(path) { original(parent, path) } else { 0 }
 });
 hook!(model_path(parent: i64, path: *const c_char) -> i32, 0x200D5B0, |original| {
-    if bounded_string(path, 65536).is_some_and(valid_path) { original(parent, path) } else { 0 }
+    if valid_game_path(path) { original(parent, path) } else { 0 }
 });
 hook!(model_create(parent: i64, path: *const c_char) -> i32, 0x200CFC0, |original| {
-    if bounded_string(path, 65536).is_some_and(valid_path) { original(parent, path) } else { 0 }
+    if valid_game_path(path) { original(parent, path) } else { 0 }
 });
 hook!(model_alloc(parent: i32, path: *const c_char, persistent: bool) -> i32, 0x200CD00, |original| {
-    if read::<u16>(address(0x16293150)) != 0 && bounded_string(path, 64).is_some() { original(parent, path, persistent) } else { 0 }
+    if read::<u16>(address(0x16293150)) != 0 && game_string(path, 64).is_some() { original(parent, path, persistent) } else { 0 }
 });
 
 hook!(package_int(msg: *mut LobbyMsg, key: *const c_char, value: *mut i32) -> bool, 0x1EEA3E0, |original| {
@@ -266,7 +275,7 @@ hook!(instant(sender: u64, _controller: u32, message: *const u8, length: u32) ->
     let mut data = [0u8; 2048];
     game_fn!(0x20FD0B0, unsafe extern "C" fn(*mut Msg, *mut u8, i32))(&mut msg, data.as_mut_ptr(), remaining as i32);
     if msg.overflowed != 0 { return 0; }
-    game_fn!(0x1EEA130, unsafe extern "C" fn(u32, u64, *mut u8, i32) -> i64)(0, sender, data.as_mut_ptr(), remaining as i32)
+    game_fn!(packets::LOBBY_HANDLE_IM_RVA, unsafe extern "C" fn(u32, u64, *mut u8, i32) -> i64)(0, sender, data.as_mut_ptr(), remaining as i32)
 });
 
 unsafe fn menu_response(ent: *mut u8, cached: bool) {
@@ -368,6 +377,7 @@ pub unsafe extern "C" fn block_instant(
 pub unsafe fn create(targets: &mut Vec<usize>) -> Result<(), String> {
     macro_rules! add { ($($name:ident),* $(,)?) => { $(
         let target = address($name::RVA);
+        $name::METRIC.register();
         let original = minhook::create(target, $name::detour as *const () as usize)?;
         $name::ORIGINAL.store(original, Ordering::Release);
         targets.push(target);
@@ -442,6 +452,24 @@ mod tests {
         assert!(!valid_path(
             &[b"foo.".as_slice(), &[b'x'; 64], b".end"].concat()
         ));
+    }
+    #[test]
+    fn game_path_matches_original_segment_checks() {
+        unsafe {
+            assert!(!valid_game_path(std::ptr::null()));
+            for left in [0, 1, 63, 64, 65] {
+                for right in [0, 1, 63, 64, 65] {
+                    let path = [vec![b'a'; left], vec![b'.'], vec![b'b'; right]].concat();
+                    let path = std::ffi::CString::new(path).unwrap();
+                    assert_eq!(valid_game_path(path.as_ptr()), left < 64 && right < 64);
+                }
+            }
+            assert!(valid_game_path(c"".as_ptr()));
+            let mut path = b"a.".repeat(32768);
+            assert!(!valid_game_path(path.as_ptr().cast())); // No NUL within the cap.
+            path[65535] = 0;
+            assert!(valid_game_path(path.as_ptr().cast()));
+        }
     }
     #[test]
     fn malformed_directives() {

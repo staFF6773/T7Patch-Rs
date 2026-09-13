@@ -5,6 +5,78 @@ use crate::{
 };
 use std::ffi::CStr;
 
+pub(crate) const LOBBY_HANDLE_IM_RVA: usize = 0x1EEA130;
+// Verified from the live September2026 call at LobbyMsg_HandleIM+0x20:
+// E8 9B 03 00 00 -> RVA 0x1EE9E30. In the baseline address map this is
+// 0x1EEA4F0, NOT 0x1EEA150 (which is the call instruction itself).
+const LOBBY_PREP_READ_DATA_RVA: usize = 0x1EEA4F0;
+
+const HANDLE_IM_PREFIX: &[u8] = &[
+    0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00, 0x49, 0x8b, 0xc0,
+    0x8b, 0xf9, 0x48, 0x8b, 0xda, 0x48, 0x8d, 0x4c, 0x24, 0x30, 0x45, 0x8b, 0xc1, 0x48, 0x8b, 0xd0,
+];
+const PREP_READ_DATA_PREFIX: &[u8] = &[
+    0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0x41, 0x8b, 0xf8, 0x48, 0x8b, 0xd9,
+];
+const PREP_READ_DATA_EPILOGUE: &[u8] = &[
+    0x48, 0x8b, 0xcb, 0x89, 0x7b, 0x1c, 0x48, 0x8b, 0x5c, 0x24, 0x30, 0x48, 0x83, 0xc4, 0x20, 0x5f,
+];
+
+fn relative_target(code: &[u8], base: usize, offset: usize, opcode: u8) -> Option<usize> {
+    let instruction = code.get(offset..offset.checked_add(5)?)?;
+    if instruction[0] != opcode {
+        return None;
+    }
+    let displacement = i32::from_le_bytes(instruction[1..5].try_into().ok()?);
+    base.checked_add(offset)?
+        .checked_add(5)?
+        .checked_add_signed(displacement as isize)
+}
+
+fn reader_code_matches(
+    handler_code: &[u8],
+    handler: usize,
+    prepare_code: &[u8],
+    prepare: usize,
+    initialize: usize,
+    read_message: usize,
+) -> bool {
+    handler_code.starts_with(HANDLE_IM_PREFIX)
+        && relative_target(handler_code, handler, 0x20, 0xe8) == Some(prepare)
+        && prepare_code.starts_with(PREP_READ_DATA_PREFIX)
+        && relative_target(prepare_code, prepare, 0x10, 0xe8) == Some(initialize)
+        && prepare_code.get(0x15..0x25) == Some(PREP_READ_DATA_EPILOGUE)
+        && relative_target(prepare_code, prepare, 0x25, 0xe9) == Some(read_message)
+}
+
+/// Validate the native call relationship before any game hooks are enabled.
+/// The helper initializes Msg, publishes cursize, then tail-calls PrepReadMsg.
+pub unsafe fn validate_message_reader() -> std::result::Result<(), std::string::String> {
+    use crate::game_build::address;
+    let handler = address(LOBBY_HANDLE_IM_RVA);
+    let prepare = address(LOBBY_PREP_READ_DATA_RVA);
+    if !memory::readable(handler, 0x25) || !memory::readable(prepare, 0x2a) {
+        return Err("Lobby message-reader code is not readable".into());
+    }
+    if !reader_code_matches(
+        std::slice::from_raw_parts(handler as *const u8, 0x25),
+        handler,
+        std::slice::from_raw_parts(prepare as *const u8, 0x2a),
+        prepare,
+        address(0x20FCB80),
+        address(0x1EEB8D0),
+    ) {
+        return Err(
+            "Lobby message-reader signature mismatch; refusing to call an unverified entry point"
+                .into(),
+        );
+    }
+    crate::diagnostics::event(format_args!(
+        "message-reader-validated handler={handler:#x} prepare_read_data={prepare:#x}"
+    ));
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum Kind {
     Int,
@@ -412,7 +484,7 @@ pub unsafe fn check_pending_info(sender: u64, msg: &Msg) -> bool {
     }
     let mut lobby = LobbyMsg::default();
     if game_fn!(
-        0x1EEA150,
+        LOBBY_PREP_READ_DATA_RVA,
         unsafe extern "C" fn(*mut LobbyMsg, *mut u8, i32) -> u8
     )(&mut lobby, data.as_mut_ptr(), size as i32)
         == 0
@@ -445,6 +517,143 @@ pub unsafe fn check_pending_info(sender: u64, msg: &Msg) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Captured with ReadProcessMemory from the user's September2026 executable,
+    // not reconstructed from the port's old address constants.
+    const HANDLE_IM_CAPTURE: &[u8] = &[
+        0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00, 0x49, 0x8b,
+        0xc0, 0x8b, 0xf9, 0x48, 0x8b, 0xda, 0x48, 0x8d, 0x4c, 0x24, 0x30, 0x45, 0x8b, 0xc1, 0x48,
+        0x8b, 0xd0, 0xe8, 0x9b, 0x03, 0x00, 0x00,
+    ];
+    const PREPARE_CAPTURE: &[u8] = &[
+        0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0x41, 0x8b, 0xf8, 0x48, 0x8b,
+        0xd9, 0xe8, 0x7b, 0x26, 0x21, 0x00, 0x48, 0x8b, 0xcb, 0x89, 0x7b, 0x1c, 0x48, 0x8b, 0x5c,
+        0x24, 0x30, 0x48, 0x83, 0xc4, 0x20, 0x5f, 0xe9, 0xb6, 0x13, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn message_reader_matches_live_call_graph_and_rejects_old_call_site() {
+        use crate::game_build::{translate_rva, Build};
+        let handler = translate_rva(LOBBY_HANDLE_IM_RVA, Build::September2026);
+        let prepare = translate_rva(LOBBY_PREP_READ_DATA_RVA, Build::September2026);
+        assert_eq!(handler, 0x1ee9a70);
+        assert_eq!(prepare, 0x1ee9e30);
+        for base in [0, 0x7ff6ee2b0000usize] {
+            assert!(reader_code_matches(
+                HANDLE_IM_CAPTURE,
+                base + handler,
+                PREPARE_CAPTURE,
+                base + prepare,
+                base + 0x20fc4c0,
+                base + 0x1eeb210
+            ));
+            assert!(!reader_code_matches(
+                HANDLE_IM_CAPTURE,
+                base + handler,
+                PREPARE_CAPTURE,
+                base + handler + 0x20,
+                base + 0x20fc4c0,
+                base + 0x1eeb210
+            ));
+        }
+        // The old baseline 0x1EEA150 is an E8 call inside HandleIM, not a function.
+        assert_eq!(
+            translate_rva(0x1EEA150, Build::September2026),
+            handler + 0x20
+        );
+        assert_eq!(HANDLE_IM_CAPTURE[0x20], 0xe8);
+        let mut corrupt = PREPARE_CAPTURE.to_vec();
+        corrupt[0x25] = 0xc3;
+        assert!(!reader_code_matches(
+            HANDLE_IM_CAPTURE,
+            handler,
+            &corrupt,
+            prepare,
+            0x20fc4c0,
+            0x1eeb210
+        ));
+        assert_eq!(
+            relative_target(&[0xe8, 0xfb, 0xff, 0xff, 0xff], 0x1000, 0, 0xe8),
+            Some(0x1000)
+        );
+        assert_eq!(relative_target(&[0xe8], 0x1000, 0, 0xe8), None);
+    }
+
+    #[test]
+    fn captured_prepare_entry_preserves_abi_and_initializes_reader_before_parsing() {
+        use windows_sys::Win32::System::Memory::*;
+        unsafe extern "C" fn initialize(msg: *mut Msg, data: *mut u8, length: i32) {
+            msg.write(Msg {
+                data,
+                max_size: length as u32,
+                ..Msg::default()
+            });
+        }
+        unsafe extern "C" fn parse(lobby: *mut LobbyMsg) -> u8 {
+            let msg = &mut (*lobby).msg;
+            // The captured helper must publish cursize after initialize and
+            // pass the same reader to this tail call.
+            if msg.data.is_null() || msg.cur_size != 3 || msg.max_size != 3 || msg.read_count != 0 {
+                return 0;
+            }
+            (*lobby).msg_type = *msg.data as i32;
+            msg.read_count = 1;
+            1
+        }
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            );
+            assert!(!page.is_null());
+            struct Allocation(*mut std::ffi::c_void);
+            impl Drop for Allocation {
+                fn drop(&mut self) {
+                    unsafe {
+                        VirtualFree(self.0, 0, MEM_RELEASE);
+                    }
+                }
+            }
+            let _allocation = Allocation(page);
+            let mut code = [0xcc; 256];
+            code[..PREPARE_CAPTURE.len()].copy_from_slice(PREPARE_CAPTURE);
+            // Only relocate the call/jump to two local absolute-jump stubs.
+            code[0x11..0x15].copy_from_slice(&0x6bi32.to_le_bytes());
+            code[0x26..0x2a].copy_from_slice(&0x76i32.to_le_bytes());
+            for (offset, target) in [
+                (0x80, initialize as *const () as usize),
+                (0xa0, parse as *const () as usize),
+            ] {
+                code[offset..offset + 6].copy_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+                code[offset + 6..offset + 14].copy_from_slice(&target.to_le_bytes());
+            }
+            memory::write_bytes(page as usize, &code).unwrap();
+            let mut old = 0;
+            assert_ne!(VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &mut old), 0);
+            let prepare: unsafe extern "C" fn(*mut LobbyMsg, *mut u8, i32) -> u8 =
+                std::mem::transmute(page);
+            #[repr(C)]
+            struct Guarded {
+                before: u64,
+                lobby: LobbyMsg,
+                after: u64,
+            }
+            let mut state = Guarded {
+                before: 0x12345678,
+                lobby: LobbyMsg::default(),
+                after: 0xabcdef01,
+            };
+            let mut payload = [1u8, 2, 3];
+            assert_eq!(prepare(&mut state.lobby, payload.as_mut_ptr(), 3), 1);
+            assert_eq!(state.lobby.msg.data, payload.as_mut_ptr());
+            assert_eq!(state.lobby.msg.read_count, 1);
+            assert_eq!(state.lobby.msg_type, 1);
+            assert_eq!(state.before, 0x12345678);
+            assert_eq!(state.after, 0xabcdef01);
+        }
+    }
+
     struct Fake {
         count: i32,
         elements: usize,

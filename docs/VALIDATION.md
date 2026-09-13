@@ -141,6 +141,58 @@ UI smoke mode does not demonstrate in-game activation. The launcher protocol dis
 
 These corrections affect protocol cases that the C++ handled inconsistently. Interoperability with another player using the C++ version must be checked, especially when changing the password during a session.
 
+## Performance diagnostics
+
+For an FPS regression, first close BO3 and the launcher, run `scripts/build.ps1`, and launch `dist/t7patch.exe`. The script packages **Release** binaries together; plain `cargo build` creates Debug binaries and does not replace the DLL in `dist`. An active DLL with debug assertions enabled now identifies itself in the launcher's status text.
+
+Compare the same menu and map before and after activation, recording FPS/frame times and whether the slowdown persists after `Patch active`. User-supplied September2026 Release profiling showed `memory.bounded_string` consuming nearly the entire sampled `hook.model_path` time (roughly 2.5–4.2 ms per call in several steady-state windows). Removing the duplicate query alone did not resolve the reported 1–2 FPS regression.
+
+The six UI string hooks (`binding`, `model_string`, `model_path0`, `model_path`, `model_create`, `model_alloc`) now use `memory::game_string`: a direct, bounded byte scan with no `VirtualQuery`. This follows the reference's direct `strlen`/copy approach in [`Hooks.cpp`, revision b9450b2](https://github.com/Scroptss/T7Patch-src/blob/b9450b229639193c16ef21effc80aa28745eb683/Hooks.cpp). Model keys must still be shorter than 64 bytes per segment; the port's total path cap of 65536 bytes, 4096-byte localization buffers, null handling, and content sanitizers remain. The reader relies on live, readable engine-owned strings, as the original does; it does not validate arbitrary non-null pointers. It stops at NUL without reading the entire cap or caching memory permissions. Exported inputs and packet-boundary checks retain the queried reader.
+
+The profile header identifies this implementation with **`ui_strings=direct-bounded-v1`**. `memory.game_string` measures the new UI reader, while `memory.bounded_string` measures the remaining queried callers. Subsequent user profiling showed direct UI reads around 0.05–0.1 microseconds and fast model hooks, but also a freeze when entering Zombies. The mode-transition fixes below still require in-game confirmation.
+
+For a local relative-cost check on valid engine-like strings, run:
+
+```powershell
+cargo test --release --locked --target x86_64-pc-windows-msvc --lib ui_string_reader_benchmark -- --ignored --nocapture
+```
+
+This reports the median of five batches for queried versus direct reads. It is not an in-game benchmark: BO3's virtual-memory layout and query cost differ from the test process. Automated tests cover terminators next to an inaccessible page, length caps, raw byte preservation, and the original per-segment path rules.
+
+If the slowdown persists:
+
+1. Close BO3. Create an empty file named **`t7patch-profile.enabled`** alongside the launcher's `t7patch.conf` (normally in `dist`). For legacy loaders, use the configuration directory instead.
+2. Start the launcher and BO3. After activation, reproduce the slow menu or match for about 30 seconds.
+3. Read **`t7patch-profile.log`** in that same directory. It appends a session header identifying the game build and Debug/Release assertion setting, then one aggregate report approximately every five seconds. The first window can include installation time; prefer subsequent windows for steady-state comparisons.
+4. Share the log and corresponding FPS/frame times. Remove the `.enabled` file and restart BO3 to compare with profiling disabled.
+
+Each row contains `metric calls calls/s samples avg_us max_us`. Hooked game and Steam functions have individual counters; `memory.game_string`, `memory.bounded_string`, `exceptions.handle`, and `exceptions.lobby_sentinel` identify string-reading and exception traffic. Every call is counted, but only the first and then every 1024th call per window is timed. Samples use **inclusive wall time**, so nested rows overlap and must not be summed. Exception timing excludes the operating system's dispatch/resume cost; high exception frequency remains significant even when handler timings are small. Counts and samples are approximate at window boundaries, and sampled maxima can miss rare stalls.
+
+Profiling is opt-in and checked once during installation. Disabled instrumentation only checks atomic flags; enabled hooks update counters, time sampled calls, and track in-flight calls in a fixed-capacity atomic table. A dedicated diagnostics worker formats and writes the reports independently of configuration polling. Profiling still adds overhead, so use a disabled run to confirm the final FPS result. Performance logs contain metric names, thread IDs and timings, not packet contents or configuration values.
+
+## Mode-transition hangs
+
+The official sources were reviewed at [Black-Ops-3-Projects revision 23536c2, ZBR Native/FPSCounter](https://github.com/shiversoftdev/Black-Ops-3-Projects/tree/23536c20d6488db0282def47b74279d54112fb60/Zombie%20Blood%20Rush%20(Native)/FPSCounter), particularly `protection.cpp` and `dllmain.cpp`. That source revision uses older game offsets and is not a drop-in address map for the recognized September2026 executable. Matching a source baseline is not proof of equivalence with the user's working official binary.
+
+Corrections in this build:
+
+- `check_pending_info` now calls the actual `LobbyMsgRW_PrepReadData` entry (baseline `0x1EEA4F0`, September `0x1EE9E30`). The inherited `0x1EEA150` mapped to `LobbyMsg_HandleIM+0x20`, an internal CALL instruction. Entering there skipped the caller's prologue and continued through it with an invalid stack frame. Installation validates the call relationship and the helper's initializer/tail jump before enabling hooks.
+- Steam friend refresh no longer holds the Rust cache mutex while calling Steam. Reentrant/concurrent readers use the last complete snapshot while a refresh is in progress; unknown users remain rejected. Failed refreshes preserve the previous snapshot and allow a retry. Tests exercise a reentrant callback and a concurrent reader.
+- Once installation reports ACTIVE, launcher status checks use the four-byte `T7PatchStatus` data export rather than new remote threads and their DLL/TLS initialization callbacks. Waiting-for-initialization retries still use the bootstrap. Parser and process-memory tests cover the new data export and detection of deactivation.
+- An invalid script-instance index is rejected before modifying the exception context.
+
+The follow-up crash showed an access violation at September RVA `0x20FC9CF`, followed by `before-NtSuspendProcess`. A read-only inspection of the live game confirmed that instruction is `movzx eax, byte ptr [r9+rax]` in `MSG_ReadByte`; both registers were zero in the crash. A stack return address also matched `LobbyMsg_HandleIM+0xAB`, its integer-field read. The live code exposed the wrong entry above: the E8 at `0x1EE9A90` calls `0x1EE9E30`, whose prologue initializes the reader and tail-jumps to `0x1EEB210` (`PrepReadMsg`). The on-disk game code is protected and was not used to infer those instructions. An older minidump in the game folder described a different exception and was not treated as evidence for this crash.
+
+Regression tests retain the captured 37-byte caller prefix and 42-byte helper, verify their relative targets, and reject the old call-site address. A native execution test replays the captured helper in a test allocation with only its call/jump relocated to local stubs, checking argument forwarding, cursize initialization, return behavior and surrounding canaries. No game functions are called by those tests.
+
+To verify in BO3, restart both programs, launch the new `dist/t7patch.exe`, enter Zombies, load a match, and return to the menu. The newest profile/journal session includes **`lobby_reader=validated-v2`**; the event journal also records `message-reader-validated` with the selected addresses. The entry-point defect is confirmed from live code, while in-game recovery with the rebuilt DLL remains to be confirmed. A signature mismatch is reported as an installation error rather than calling an unverified function.
+
+For a persistent hang, enable profiling as above and check **`hang_tracking=v1`** in the newest session header. Calls lasting at least two seconds produce lines such as `PENDING thread=123 call=steam.owns age_ms=5100`, even if the call was not selected for timing and never returns. Nested calls can appear together. Tracking is bounded to 256 simultaneous calls; `PENDING overflow=...` means some calls could not be tracked. A PENDING line identifies an outstanding call, not proof of deadlock. The independent diagnostics worker can still report a blocked settings worker; it cannot run if the entire process is suspended.
+
+`t7patch-events.log` is created beside `t7patch.conf` during installation, even with profiling disabled. Its pre-opened handle records `unhandled-exception` before detailed crash logging and `before-NtSuspendProcess` immediately before process suspension. Fatal script errors produce `fatal-script` before the existing error dialog. `crashes.log` now uses the same configuration directory, with a PID-specific TEMP fallback if the event journal cannot be opened there. Journal open/write errors also go to `OutputDebugStringA`. The existing known exception recoveries and fatal suspension behavior are retained; a freeze with no `crashes.log` is not assumed to be a recoverable error.
+
+If the freeze remains, collect the last profile windows (wait 15 seconds after the freeze), the newest event-journal session and `crashes.log` if present. This distinguishes an outstanding callback from the patch's explicit fatal path.
+
 ## Pending in-game checks
 
 For each recognized executable, on both Windows and Wine/Proton:

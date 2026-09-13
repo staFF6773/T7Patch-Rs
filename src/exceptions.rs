@@ -101,6 +101,8 @@ unsafe extern "system" fn dispatch(record: *mut EXCEPTION_RECORD, context: *mut 
 }
 
 unsafe fn handle(record: *mut EXCEPTION_RECORD, context: *mut CONTEXT) -> bool {
+    let _pending = crate::profiling::EXCEPTIONS.track();
+    let _sample = crate::profiling::EXCEPTIONS.enter();
     if record.is_null() || context.is_null() {
         return false;
     }
@@ -168,12 +170,12 @@ unsafe fn handle(record: *mut EXCEPTION_RECORD, context: *mut CONTEXT) -> bool {
         return true;
     }
     if fault == address(0x12EA4E0) {
-        context.Rip += 4;
-        context.Rsp -= 0x30;
         let instance = (context.Rcx & 0xff) as usize;
         if instance > 1 {
             return false;
         }
+        context.Rip += 4;
+        context.Rsp -= 0x30;
         let fatal_ptr = address(0x5124869) + 35392 * instance;
         let message_ptr = address(0x51A3710) + 0x78 * instance;
         let text = if memory::readable(message_ptr, 8) {
@@ -183,10 +185,14 @@ unsafe fn handle(record: *mut EXCEPTION_RECORD, context: *mut CONTEXT) -> bool {
         };
         let fatal = memory::readable(fatal_ptr, 1) && read::<u8>(fatal_ptr) != 0;
         if fatal || text.windows(14).any(|w| w == b"Invalid opcode") {
+            crate::diagnostics::event(format_args!(
+                "fatal-script instance={instance} rip={:#x}",
+                context.Rip
+            ));
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("crashes.log")
+                .open(crate::diagnostics::crash_path())
             {
                 let _ = writeln!(
                     file,
@@ -201,7 +207,7 @@ unsafe fn handle(record: *mut EXCEPTION_RECORD, context: *mut CONTEXT) -> bool {
             }
             windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxA(
                 std::ptr::null_mut(),
-                c"A fatal script error was recorded in crashes.log."
+                c"A fatal script error occurred. Check crashes.log beside t7patch.conf (or the T7 Patch logs in TEMP)."
                     .as_ptr()
                     .cast(),
                 c"T7 Patch - Fatal Script Error".as_ptr().cast(),
@@ -212,10 +218,18 @@ unsafe fn handle(record: *mut EXCEPTION_RECORD, context: *mut CONTEXT) -> bool {
         return true;
     }
     if record.ExceptionCode as u32 == 0xC0000005 || record.ExceptionFlags & 1 != 0 {
+        crate::diagnostics::event(format_args!(
+            "unhandled-exception code={:#x} flags={:#x} address={:#x} rip={:#x} rcx={:#x} game_base={:#x}",
+            record.ExceptionCode, record.ExceptionFlags, fault, context.Rip, context.Rcx, crate::game_build::image_base()));
         log_crash(record, context);
+        crate::diagnostics::event(format_args!(
+            "before-NtSuspendProcess rip={:#x}",
+            context.Rip
+        ));
         let suspend: unsafe extern "system" fn(*mut c_void) -> i32 =
             std::mem::transmute(SUSPEND.load(Ordering::Acquire));
         suspend(GetCurrentProcess());
+        crate::diagnostics::event(format_args!("NtSuspendProcess-returned"));
     }
     false
 }
@@ -227,7 +241,7 @@ unsafe fn log_crash(record: &EXCEPTION_RECORD, context: &CONTEXT) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("crashes.log")
+        .open(crate::diagnostics::crash_path())
     {
         let mut module = std::ptr::null_mut();
         RtlPcToFileHeader(record.ExceptionAddress, &mut module);
@@ -279,6 +293,8 @@ unsafe fn log_crash(record: &EXCEPTION_RECORD, context: &CONTEXT) {
             );
         }
         let _ = file.flush();
+    } else {
+        crate::diagnostics::event(format_args!("crash-log-open-failed"));
     }
     LOGGING.store(false, Ordering::Release);
 }

@@ -27,6 +27,7 @@ struct State {
     targets: Vec<usize>,
     enabled: Vec<usize>,
     worker: Option<JoinHandle<()>>,
+    profiler_worker: Option<JoinHandle<()>>,
     priority: u32,
 }
 impl State {
@@ -40,6 +41,7 @@ impl State {
             targets: Vec::new(),
             enabled: Vec::new(),
             worker: None,
+            profiler_worker: None,
             priority: 0,
         }
     }
@@ -47,6 +49,8 @@ impl State {
         if crate::game_build::current_build() == crate::game_build::Build::Unknown {
             return Err("Unsupported executable; no game patches applied".into());
         }
+        crate::diagnostics::initialize(&config::path());
+        let profiler = crate::profiling::Reporter::start(&config::path());
         // A callback/trampoline may still be running after logical Unload. Keep its code mapped.
         let mut module = std::ptr::null_mut();
         if GetModuleHandleExA(
@@ -58,6 +62,7 @@ impl State {
             return Err("Could not pin patch DLL".into());
         }
         self.integrity = Some(Integrity::install()?);
+        crate::packets::validate_message_reader()?;
         minhook::initialize()?;
         self.handler = Some(Handler::install()?);
         hooks::create(&mut self.targets)?;
@@ -96,10 +101,12 @@ impl State {
                 while !STOP.load(Ordering::Acquire) {
                     if let Ok(mut state) = STATE.try_lock() {
                         if let Some(integrity) = &mut state.integrity {
+                            let _pending = crate::profiling::INTEGRITY_MAINTAIN.track();
                             integrity.maintain();
                         }
                     }
                     if let Some(watcher) = &mut watcher {
+                        let _pending = crate::profiling::CONFIG_POLL.track();
                         watcher.poll();
                     }
                     for _ in 0..10 {
@@ -112,7 +119,25 @@ impl State {
             })
             .map_err(|e| e.to_string())?;
         self.worker = Some(worker);
+        if let Some(mut profiler) = profiler {
+            // Independent of config I/O and the game: a blocked settings worker
+            // must not stop the hang reports themselves.
+            match std::thread::Builder::new()
+                .name("t7patch-diagnostics".into())
+                .spawn(move || {
+                    while !STOP.load(Ordering::Acquire) {
+                        profiler.poll();
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }) {
+                Ok(worker) => self.profiler_worker = Some(worker),
+                Err(error) => {
+                    memory::debug(&format!("Could not start diagnostics worker: {error}"))
+                }
+            }
+        }
         self.active = true;
+        crate::T7PatchStatus.store(crate::launcher_api::ACTIVE, Ordering::Release);
         Ok(())
     }
     unsafe fn deactivate(&mut self, rollback: bool) {
@@ -155,6 +180,22 @@ impl State {
             SetPriorityClass(GetCurrentProcess(), self.priority);
         }
         self.active = false;
+        crate::T7PatchStatus.store(
+            if rollback {
+                crate::launcher_api::FAILED
+            } else {
+                crate::launcher_api::DEACTIVATED
+            },
+            Ordering::Release,
+        );
+    }
+}
+
+fn active_message() -> &'static str {
+    if cfg!(debug_assertions) {
+        "Patch active (Debug DLL; rebuild with --release)"
+    } else {
+        "Patch active"
     }
 }
 
@@ -211,7 +252,7 @@ unsafe fn install_checked(path: Option<std::path::PathBuf>) -> (u32, String) {
         if let Some(path) = path {
             config::set_path(path);
         }
-        return (ACTIVE, "Patch active".into());
+        return (ACTIVE, active_message().into());
     }
     if state.attempted {
         let error = LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -237,7 +278,7 @@ unsafe fn install_checked(path: Option<std::path::PathBuf>) -> (u32, String) {
     match state.start() {
         Ok(()) => {
             memory::debug("Installed");
-            (ACTIVE, "Patch active".into())
+            (ACTIVE, active_message().into())
         }
         Err(error) => {
             state.deactivate(true);
@@ -252,14 +293,13 @@ pub unsafe fn uninstall() {
     let _lifecycle = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
     // Joining happens outside the state lock: the worker may be maintaining integrity patches.
     STOP.store(true, Ordering::Release);
-    let worker = STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .worker
-        .take();
-    if let Some(worker) = worker {
+    let (worker, profiler_worker) = {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        (state.worker.take(), state.profiler_worker.take())
+    };
+    for worker in [worker, profiler_worker].into_iter().flatten() {
         if worker.join().is_err() {
-            memory::debug("Configuration worker panicked");
+            memory::debug("Patch worker panicked");
         }
     }
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());

@@ -6,6 +6,8 @@ A Rust desktop launcher and DLL for **64-bit Black Ops III / T7**. The launcher 
 
 **Status: experimental.** The Windows UI and loading mechanism have been checked locally, including remote loading into a dedicated test process. Full operation inside BO3 and compatibility with Wine/Proton still require runtime validation.
 
+This is a reimplementation based on the listed source references, not the official Serious DLL. The Scroptss source baseline and the official published ZBR Native sources are different revisions; equivalence to the latest official binary has not been established. User testing identified a UI string-query performance regression (corrected) and a mode-transition crash traced to an incorrect message-reader entry point. The corrected entry was verified in live September2026 code; successful mode transitions with the rebuilt DLL still need confirmation. See [hang diagnostics](docs/VALIDATION.md#mode-transition-hangs).
+
 ## Platform support
 
 | Platform | How it runs | Validation status |
@@ -98,6 +100,7 @@ This is for an existing standalone Wine setup, not a replacement for the Steam/P
 | Settings cannot be read or saved | Use a writable patch folder. With Flatpak, grant access to that folder. |
 | Waiting for game initialization | Allow BO3 to finish starting. If it never becomes ready, capture the status and game build details for investigation. |
 | Unsupported executable, integrity pattern mismatch, or a permanent installation error | Check the recognized build fingerprints and read the full status message. A failed installation attempt requires restarting BO3. |
+| Very low FPS after activation | Use the Release DLL and launcher from the same build. Plain `cargo build` produces Debug binaries, and does not update `dist`. The launcher displays `Debug DLL` when that DLL has debug assertions enabled. See [performance diagnostics](docs/VALIDATION.md#performance-diagnostics). |
 
 ## Build from source
 
@@ -158,22 +161,22 @@ The DLL preserves the six original API exports:
 
 `T7PatchStart(void*)` implements the new launcher's version 1 API. It accepts a structure without internal pointers, containing the absolute UTF-16 configuration path, and returns a status and message. Its signature is compatible with a Windows x64 thread entry point. C/C++ declarations are in [`include/t7patch.h`](include/t7patch.h).
 
-`DllMain` does not install the patch automatically. The launcher calls `LoadLibraryW` inside BO3, followed by `T7PatchStart`, **outside `DllMain`**. It resolves the remote module containing `LoadLibraryW` and the DLL export's RVA without assuming identical module bases across processes. Status is polled approximately every two seconds.
+`DllMain` does not install the patch automatically. The launcher calls `LoadLibraryW` inside BO3, followed by `T7PatchStart`, **outside `DllMain`**. It resolves the remote module containing `LoadLibraryW` and the DLL export's RVA without assuming identical module bases across processes. Initialization retries occur approximately every two seconds. After activation, the launcher reads the aligned four-byte **data export `T7PatchStatus`** with `ReadProcessMemory`, instead of repeatedly creating remote threads. That snapshot also reports logical deactivation. With older DLLs lacking the data export, the launcher retains the confirmed state until the process exits or the launcher reconnects.
 
 Legacy loaders can still call `zbr_run_gamemode_lui` once Steam and the lobby are ready. An early call only reports that the game is not ready and does not consume the installation attempt. File settings are applied during installation and when the contents change.
 
-Installation checks the PE fingerprint and integrity pattern counts. Diagnostics use `OutputDebugStringA` with the `T7 Patch Rust:` prefix.
+Installation checks the PE fingerprint and integrity pattern counts. Diagnostics use `OutputDebugStringA` with the `T7 Patch Rust:` prefix. A small `t7patch-events.log` beside the configuration records session startup and fatal paths before process suspension; `crashes.log` is also written beside the configuration. If opening the journal there fails, the fallback is `%TEMP%/t7patch-events-<PID>.log` and `%TEMP%/t7patch-crashes-<PID>.log`.
 
 ### Recognized game builds
 
-`src/game_build.rs` retains the original project's fingerprints; no new offsets were derived:
+`src/game_build.rs` retains the reference project's fingerprints:
 
 | Original identifier | PE TimeDateStamp | Accepted SizeOfImage |
 | --- | --- | --- |
 | February2026 | `0x693D731E` | `0x1D74AC00`, `0x1D74B000` |
 | September2026 | `0x6A7B6355` | `0x1D75BC00`, `0x1D75C000` |
 
-The September build uses a `-0x6C0` adjustment over the RVA interval `[0x1D29C20, 0x2EFF000)`. These values come from the original project and have not yet been validated against a running game during this migration.
+The September build uses a `-0x6C0` adjustment over the RVA interval `[0x1D29C20, 0x2EFF000)`. Most addresses remain inherited from the reference. The lobby-message preparation entry was corrected from live inspection: baseline RVA `0x1EEA4F0` maps to September RVA `0x1EE9E30`. Installation now validates the native call to that helper, its initializer and its tail jump before enabling hooks. Details and captured regression fixtures are in `src/packets.rs` and [Port Validation](docs/VALIDATION.md#mode-transition-hangs).
 
 ### Exception handling
 
@@ -187,7 +190,7 @@ The Wine path is implemented, **but has not been executed under Wine/Proton here
 
 ## Deactivation and lifetime
 
-`Unload()` performs **logical deactivation**, not physical DLL unloading. It waits for the worker before restoring hooks. The DLL remains pinned to the process and retains trampolines, the cloned virtual table, and an inactive exception handler so in-flight calls do not jump into freed code. The handler still recognizes a sentinel pointer another thread may have read before restoration.
+`Unload()` performs **logical deactivation**, not physical DLL unloading. It waits for the workers before restoring hooks. The DLL remains pinned to the process and retains trampolines, the cloned virtual table, and an inactive exception handler so in-flight calls do not jump into freed code. The handler still recognizes a sentinel pointer another thread may have read before restoration.
 
 As in the original, integrity patches remain until process exit after a successful installation. Names published to Steam have immutable, persistent storage. Player names, the modified seed, and configured dvar values are not reverted either. Restart BO3 to install again after `Unload()` or a failed installation. Complete restoration of game state is not claimed.
 

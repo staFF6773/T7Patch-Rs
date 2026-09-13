@@ -8,6 +8,7 @@ compile_error!("T7 Patch requires x86_64-pc-windows-msvc");
 mod memory;
 mod arxan;
 mod config;
+mod diagnostics;
 mod exceptions;
 pub mod game_build;
 pub mod hashing;
@@ -15,6 +16,7 @@ mod hooks;
 pub mod launcher_api;
 mod minhook;
 mod packets;
+mod profiling;
 mod protection;
 mod runtime;
 pub mod settings;
@@ -23,6 +25,12 @@ pub mod structs;
 use std::ffi::{c_char, c_void};
 use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
+
+/// Aligned four-byte lifecycle snapshot for passive ReadProcessMemory polling.
+/// It is published by the DLL only; loaders must never write to it.
+#[no_mangle]
+pub static T7PatchStatus: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(launcher_api::WAITING);
 
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(module: HMODULE, reason: u32, _: *mut c_void) -> i32 {

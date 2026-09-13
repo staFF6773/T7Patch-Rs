@@ -27,6 +27,11 @@ typedef struct T7PatchStartRequest {
 } T7PatchStartRequest;
 uint32_t T7PatchStart(void* request); // request must remain writable until the call returns
 
+// Optional data export "T7PatchStatus": aligned 4-byte lifecycle state, written
+// atomically by the DLL. Resolve its address and use ReadProcessMemory; never write
+// to it or call it as a function. Poll after ACTIVE without creating remote threads.
+// Values: 1=not installed yet, 2=active, 4=failed install, 5=deactivated.
+
 #ifdef __cplusplus
 }
 #endif

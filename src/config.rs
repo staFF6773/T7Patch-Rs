@@ -21,7 +21,7 @@ static CONFIG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 pub fn set_path(path: PathBuf) {
     *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
 }
-fn path() -> PathBuf {
+pub(crate) fn path() -> PathBuf {
     CONFIG_PATH
         .lock()
         .unwrap_or_else(|e| e.into_inner())

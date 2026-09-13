@@ -22,11 +22,13 @@ static ORIGINAL_PROCESSOR_FEATURE: AtomicUsize = AtomicUsize::new(0);
 struct Friends {
     next: u64,
     xuids: HashSet<u64>,
+    refreshing: bool,
 }
 static FRIENDS: LazyLock<Mutex<Friends>> = LazyLock::new(|| {
     Mutex::new(Friends {
         next: 0,
         xuids: HashSet::new(),
+        refreshing: false,
     })
 });
 static DLC: LazyLock<Mutex<HashMap<i32, bool>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -46,18 +48,59 @@ pub unsafe fn own_xuid() -> u64 {
     }
 }
 pub unsafe fn is_friend(xuid: u64) -> bool {
+    let _pending = crate::profiling::FRIENDS_REFRESH.track();
+    let _sample = crate::profiling::FRIENDS_REFRESH.enter();
     let now = GetTickCount64();
-    let mut friends = FRIENDS.lock().unwrap_or_else(|e| e.into_inner());
-    if now < friends.next || read::<u8>(address(0x1686E99E)) == 0 {
-        return friends.xuids.contains(&xuid);
+    cached_friend(
+        &FRIENDS,
+        xuid,
+        now,
+        read::<u8>(address(0x1686E99E)) != 0,
+        || fetch_friends().map(|friends| (friends, GetTickCount64())),
+    )
+}
+
+fn cached_friend(
+    cache: &Mutex<Friends>,
+    xuid: u64,
+    now: u64,
+    can_refresh: bool,
+    fetch: impl FnOnce() -> Option<(HashSet<u64>, u64)>,
+) -> bool {
+    {
+        let mut friends = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if !can_refresh || now < friends.next || friends.refreshing {
+            return friends.xuids.contains(&xuid);
+        }
+        friends.refreshing = true;
     }
+    // Steam may call back into the patch or wait for another game thread. Never
+    // hold the cache mutex across these calls. Reentrant readers use the last
+    // complete snapshot (unknown XUIDs remain rejected).
+    struct Refresh<'a>(&'a Mutex<Friends>);
+    impl Drop for Refresh<'_> {
+        fn drop(&mut self) {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).refreshing = false;
+        }
+    }
+    let _refresh = Refresh(cache);
+    let result = fetch();
+    let mut friends = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((snapshot, completed)) = result {
+        friends.xuids = snapshot;
+        friends.next = completed.saturating_add(30000);
+    }
+    friends.xuids.contains(&xuid)
+}
+
+unsafe fn fetch_friends() -> Option<HashSet<u64>> {
     let object = read::<usize>(address(0x10B3DC20));
     if !memory::readable(object, 8) {
-        return false;
+        return None;
     }
     let vtable = read::<usize>(object);
     if !memory::readable(vtable + 0x18, 16) {
-        return false;
+        return None;
     }
     let count_fn: unsafe extern "C" fn(usize, i32) -> i32 =
         std::mem::transmute(read::<usize>(vtable + 0x18));
@@ -65,18 +108,17 @@ pub unsafe fn is_friend(xuid: u64) -> bool {
         std::mem::transmute(read::<usize>(vtable + 0x20));
     let count = count_fn(object, 4);
     if !(0..=100000).contains(&count) {
-        return false;
+        return None;
     }
-    friends.xuids.clear();
+    let mut friends = HashSet::new();
     for i in 0..count {
         let mut friend = 0;
         friend_fn(object, &mut friend, i, 4);
         if friend != 0 {
-            friends.xuids.insert(friend);
+            friends.insert(friend);
         }
     }
-    friends.next = now + 30000;
-    friends.xuids.contains(&xuid)
+    Some(friends)
 }
 pub unsafe fn allow_friend(xuid: u64) -> bool {
     !config::FRIENDS_ONLY.load(Ordering::Acquire) || is_friend(xuid)
@@ -87,7 +129,10 @@ macro_rules! steam_hook {
         mod $name {
             use super::*;
             pub static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+            pub static METRIC: crate::profiling::Metric = crate::profiling::Metric::new(concat!("steam.", stringify!($name)));
             pub unsafe extern "C" fn detour($($arg: $ty),*) -> $ret {
+                let _pending = METRIC.track();
+                let _sample = METRIC.enter();
                 #[allow(unused_variables)]
                 let $original: unsafe extern "C" fn($($ty),*) -> $ret = std::mem::transmute(ORIGINAL.load(Ordering::Acquire));
                 $body
@@ -162,6 +207,8 @@ steam_hook!(chat(object: usize, lobby: u64, chat_id: i32, user: *mut u64, data: 
 });
 
 unsafe extern "C" fn idle_update(state: i64) -> i32 {
+    let _pending = crate::profiling::IDLE_UPDATE.track();
+    let _sample = crate::profiling::IDLE_UPDATE.enter();
     if hooks::campaign() {
         game_fn!(0x131E350, unsafe extern "C" fn(i64) -> i32)(state)
     } else {
@@ -223,6 +270,7 @@ unsafe fn find_import(name: &std::ffi::CStr) -> Option<usize> {
 pub unsafe fn prepare(patches: &mut Vec<Patch>) -> std::result::Result<(), String> {
     macro_rules! steam {
         ($rva:expr, $offset:expr, $name:ident) => {{
+            $name::METRIC.register();
             let object = read::<usize>(address($rva));
             if !memory::readable(object, 8) {
                 return Err(format!("Steam object not ready: {:#x}", $rva));
@@ -310,6 +358,7 @@ pub unsafe fn inspect_exception(
     if context.Rcx != 0xFFEEDDCC44332212 {
         return false;
     }
+    let _sample = crate::profiling::LOBBY_EXCEPTIONS.enter();
     let rsp = context.Rsp as usize;
     if memory::readable(rsp + 0x28, 8) && read::<usize>(rsp + 0x28) == address(0x1EEBF74) {
         packets::inspect((rsp + 0x60) as *mut LobbyMsg);
@@ -318,4 +367,65 @@ pub unsafe fn inspect_exception(
     context.Rcx = old;
     context.Rbx = old;
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache() -> Mutex<Friends> {
+        Mutex::new(Friends {
+            next: 0,
+            xuids: HashSet::from([7]),
+            refreshing: false,
+        })
+    }
+
+    #[test]
+    fn friend_refresh_allows_reentrant_and_concurrent_readers() {
+        let cache = cache();
+        assert!(cached_friend(&cache, 9, 10, true, || {
+            assert!(
+                cache.try_lock().is_ok(),
+                "must release the lock before Steam"
+            );
+            assert!(cached_friend(&cache, 7, 10, true, || panic!(
+                "recursive refresh"
+            )));
+            assert!(!cached_friend(&cache, 9, 10, true, || panic!(
+                "recursive refresh"
+            )));
+            std::thread::scope(|scope| {
+                assert!(scope
+                    .spawn(|| cached_friend(&cache, 7, 10, true, || panic!("concurrent refresh")))
+                    .join()
+                    .unwrap());
+            });
+            Some((HashSet::from([9]), 20))
+        }));
+        assert!(!cached_friend(&cache, 7, 21, true, || panic!(
+            "premature refresh"
+        )));
+        assert!(cached_friend(&cache, 9, 21, true, || panic!(
+            "premature refresh"
+        )));
+        assert_eq!(cache.lock().unwrap().next, 30020);
+    }
+
+    #[test]
+    fn failed_friend_refresh_preserves_snapshot_and_can_retry() {
+        let cache = cache();
+        assert!(cached_friend(&cache, 7, 10, true, || None));
+        assert!(!cache.lock().unwrap().refreshing);
+        assert!(cached_friend(&cache, 7, 10, false, || panic!(
+            "in-game refresh"
+        )));
+        assert!(cached_friend(&cache, 9, 11, true, || Some((
+            HashSet::from([9]),
+            11
+        ))));
+        assert!(!cached_friend(&cache, 7, 12, true, || panic!(
+            "premature refresh"
+        )));
+    }
 }

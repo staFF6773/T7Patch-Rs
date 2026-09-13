@@ -32,6 +32,8 @@ fn main() {
         let install: unsafe extern "C" fn(*const c_char) =
             std::mem::transmute(symbol(c"zbr_run_gamemode_lui"));
         let unload: unsafe extern "C" fn() = std::mem::transmute(symbol(c"Unload"));
+        let status = symbol(c"T7PatchStatus").cast::<std::sync::atomic::AtomicU32>();
+        assert_eq!((*status).load(std::sync::atomic::Ordering::Acquire), 1);
         friends(true);
         name(c"Rust smoke".as_ptr());
         name(std::ptr::null());
