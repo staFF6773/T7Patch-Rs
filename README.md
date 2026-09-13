@@ -42,7 +42,7 @@ The UI follows the dark style and controls of the reference screenshot. Its foot
 
 ## Launcher updates
 
-Starting with **v0.2.0**, the launcher checks the latest stable [GitHub Release](https://github.com/staFF6773/T7Patch-Rs/releases) when opened. **Check for updates** repeats the check manually. Updates come from `staFF6773/T7Patch-Rs` over HTTPS without a GitHub login; a commit or temporary Actions artifact is not an update release.
+Starting with **v0.0.1**, the launcher checks the latest stable [GitHub Release](https://github.com/staFF6773/T7Patch-Rs/releases) when opened. **Check for updates** repeats the check manually. Updates come from `staFF6773/T7Patch-Rs` over HTTPS without a GitHub login; a commit or temporary Actions artifact is not an update release.
 
 1. When a newer version is available, click **Download update**. The interface displays download progress while normal game detection continues.
 2. The package's sizes, SHA-256 hashes, platform and EXE/DLL structure are checked before installation. Once verified, close BO3 and click **Install & restart**.
@@ -55,7 +55,7 @@ With no published Releases, the launcher displays **No published update releases
 ### Publishing an update
 
 1. Set a new stable version in `Cargo.toml` and update `Cargo.lock` with Cargo. Commit and push the changes.
-2. Publish a matching tag, for example `v0.2.0` for version `0.2.0`.
+2. Publish a matching tag, for example `v0.0.1` for version `0.0.1`.
 3. The **Release** workflow verifies the version, runs checks, builds and tests the Windows binaries, and creates `t7patch-windows-x64.zip` plus `update.json`.
 4. It uploads both assets to a draft Release before making it public. Existing public Releases are not overwritten; publish a new version for changes.
 
