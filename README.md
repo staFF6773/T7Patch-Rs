@@ -1,3 +1,5 @@
+<img src="assets/t7patch-logo.png" alt="T7 Patch Rust logo" width="96" height="96">
+
 # T7 Patch — Rust Port
 
 [![CI](https://github.com/staFF6773/T7Patch-Rs/actions/workflows/ci.yml/badge.svg)](https://github.com/staFF6773/T7Patch-Rs/actions/workflows/ci.yml)
@@ -30,19 +32,19 @@ The current build target is `x86_64-pc-windows-msvc`. There is no native Linux e
 
 1. Build the project using [Build from source](#build-from-source), or use a matching pair of compiled binaries.
 2. Keep **`dist/t7patch.exe` and `dist/t7patch.dll` in the same folder** and open `t7patch.exe` before starting BO3. The window displays `No game process found.`
-3. Set **Change Name**, **Network Password**, and **Friends Only**. Changes are saved automatically.
+3. Set **Player name**, **Network password**, and **Friends only** in the **Settings** tab. Changes are saved automatically; the tab shows pending changes or a save error. Switching tabs retains your edits.
 4. Start BO3 normally. The launcher detects `BlackOps3.exe`, loads the DLL, and waits for the game's objects to become available.
-5. `Patch active` appears only after the DLL confirms successful installation. Click the status bar to read an error message that does not fit in the window.
+5. `Patch active` appears only after the DLL confirms successful installation. The **Game connection** card highlights the active state in green. Click **Details** to read the full status or an error message that does not fit in the window.
 
 The launcher rechecks process identity through its open handle and tracks that handle to avoid confusing a reused PID with the original game process. When the game closes, it waits for the next launch. Opening a second launcher brings the existing window to the foreground.
 
 Closing the launcher leaves an already installed patch active in the game. Reopening it recognizes the loaded DLL. A permanent installation failure or explicit deactivation requires restarting BO3; a game that is still initializing is retried automatically.
 
-The UI follows the dark style and controls of the reference screenshot. Its footer credits the original author, and `Learn more` opens the original T7 Patch repository.
+The launcher has its own Rust-inspired charcoal and oxide-orange theme. **Settings**, **Updates**, and **Credits** tabs keep the interface compact, with game connection status always visible above them. Use the arrow keys while the tab strip is focused, or **Ctrl+Tab / Ctrl+Shift+Tab** from any tab, to switch sections. Hidden controls are excluded from keyboard navigation, and game detection and updates continue in the background. Native controls support visible focus and system DPI scaling. The header includes minimize and close controls; drag its empty area to move the window. **Credits** acknowledges Serious / shiversoftdev, Scroptss, T7Patch-Rs, and MinHook with links to their projects and references.
 
 ## Launcher updates
 
-Starting with **v0.0.1**, the launcher checks the latest stable [GitHub Release](https://github.com/staFF6773/T7Patch-Rs/releases) when opened. **Check for updates** repeats the check manually. Updates come from `staFF6773/T7Patch-Rs` over HTTPS without a GitHub login; a commit or temporary Actions artifact is not an update release.
+Starting with **v0.0.1**, the launcher checks the latest stable [GitHub Release](https://github.com/staFF6773/T7Patch-Rs/releases) when opened. **Check for updates** in the **Updates** tab repeats the check manually. Updates come from `staFF6773/T7Patch-Rs` over HTTPS without a GitHub login; a commit or temporary Actions artifact is not an update release.
 
 1. When a newer version is available, click **Download update**. The interface displays download progress while normal game detection continues.
 2. The package's sizes, SHA-256 hashes, platform and EXE/DLL structure are checked before installation. Once verified, close BO3 and click **Install & restart**.
