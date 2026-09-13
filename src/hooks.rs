@@ -2,7 +2,9 @@ use crate::{
     config,
     game_build::address,
     memory::{self, bounded_string, copy_string, game_string, read, store},
-    minhook, packets, protection,
+    minhook,
+    network_guard::{self, Channel, Event, Peer},
+    packets, protection,
     structs::*,
 };
 use std::{
@@ -105,13 +107,13 @@ hook!(presence(a: usize, b: usize) -> i64, 0x1E85450, |original| {
 });
 
 hook!(invite(controller: u32, message: *mut u32, xuid: u64) -> (), 0x1E19B30, |original| {
-    if protection::allow_friend(xuid) { original(controller, message, xuid); }
+    if network_guard::allow(Channel::Social, Peer::Steam(xuid), 0) && protection::allow_friend(xuid) { original(controller, message, xuid); }
 });
 hook!(join_action(controller: u32, message: *mut u32, xuid: u64) -> (), 0x1E72040, |original| {
-    if protection::allow_friend(xuid) { original(controller, message, xuid); }
+    if network_guard::allow(Channel::Social, Peer::Steam(xuid), 0) && protection::allow_friend(xuid) { original(controller, message, xuid); }
 });
 hook!(join_info(controller: u32, xuid: u64, arg: i64) -> i64, 0x1E724A0, |original| {
-    if protection::allow_friend(xuid) { original(controller, xuid, arg) } else { 0 }
+    if network_guard::allow(Channel::Social, Peer::Steam(xuid), 0) && protection::allow_friend(xuid) { original(controller, xuid, arg) } else { 0 }
 });
 
 hook!(config_string(index: i32) -> *const c_char, 0x1321130, |original| {
@@ -139,6 +141,52 @@ const LEGIT_PACKETS: &[&[u8]] = &[
     b"steamAuthReq",
     b"cfl",
 ];
+
+fn campaign_stats(command: &[u8]) -> bool {
+    command.eq_ignore_ascii_case(b"requeststats") || command.eq_ignore_ascii_case(b"requeststats\n")
+}
+
+fn limited_connectionless(command: &[u8]) -> bool {
+    // Keep connect/authentication, LM, restart, loadout and Campaign stats traffic
+    // outside this pool. They can have different burst patterns during transitions.
+    [
+        b"infoResponse".as_slice(),
+        b"statusResponse",
+        b"print",
+        b"error",
+        b"ping",
+        b"pinga",
+    ]
+    .contains(&command)
+}
+
+fn dispatch_connectionless(
+    command: &[u8],
+    envelope: Option<&Msg>,
+    campaign: impl FnOnce() -> bool,
+    admit: impl FnOnce(u32) -> bool,
+    original: impl FnOnce() -> bool,
+) -> bool {
+    let known = LEGIT_PACKETS
+        .iter()
+        .copied()
+        .find(|&known| known == command);
+    if known.is_none() && !(campaign_stats(command) && campaign()) {
+        return true;
+    }
+    if limited_connectionless(command) {
+        let bytes = envelope.map_or(0, |msg| msg.cur_size.saturating_add(msg.split_size));
+        if !admit(bytes) {
+            return true;
+        }
+    }
+    let label = known
+        .and_then(|known| std::str::from_utf8(known).ok())
+        .unwrap_or("requeststats");
+    packets::observe_connectionless(envelope, label);
+    original()
+}
+
 hook!(connectionless(client: i32, from: *mut NetAdr, msg: *mut Msg) -> bool, 0x134CD70, |original| {
     let tls = game_fn!(0x212B3D0, unsafe extern "C" fn() -> usize)();
     if !memory::readable(tls + 24, 8) { return true; }
@@ -151,9 +199,13 @@ hook!(connectionless(client: i32, from: *mut NetAdr, msg: *mut Msg) -> bool, 0x1
     let argv = read::<usize>(slot);
     if !memory::readable(argv, 8) { return true; }
     let Some(command) = bounded_string(read::<*const c_char>(argv), 1024) else { return true; };
-    if LEGIT_PACKETS.contains(&command) || (campaign() && (command.eq_ignore_ascii_case(b"requeststats") || command.eq_ignore_ascii_case(b"requeststats\n"))) {
-        original(client, from, msg)
-    } else { true }
+    let envelope = memory::readable(msg as usize, size_of::<Msg>()).then(|| msg.read_unaligned());
+    dispatch_connectionless(command, envelope.as_ref(), || campaign(), |bytes| {
+            if !memory::readable(from as usize, size_of::<NetAdr>()) { return false; }
+            let address = from.read_unaligned();
+            let peer = Peer::Address { ip: address.ipv4, port: address.port, kind: address.kind, local_net_id: address.local_net_id };
+            network_guard::allow(Channel::Connectionless, peer, bytes)
+        }, || original(client, from, msg))
 });
 
 fn sanitize_binding(input: &mut [u8]) {
@@ -266,14 +318,22 @@ hook!(checksum_copy(dest: *mut u8, source: *const u8, length: i32) -> u16, 0x211
     original(dest, source, length) ^ config::password()[1] as u16
 });
 hook!(instant(sender: u64, _controller: u32, message: *const u8, length: u32) -> i64, 0x143A620, |original| {
-    if length < 2 || length > i32::MAX as u32 || !memory::readable(message as usize, length as usize) { return 0; }
+    if !(2..=packets::MAX_INSTANT_BYTES).contains(&length) {
+        network_guard::record(Event::Instant);
+        return 0;
+    }
+    if !network_guard::allow(Channel::Instant, Peer::Steam(sender), length) { return 0; }
+    if !memory::readable(message as usize, length as usize) {
+        network_guard::record(Event::Instant);
+        return 0;
+    }
     let mut msg = Msg::default();
     game_fn!(0x20FCC10, unsafe extern "C" fn(*mut Msg, *const u8, i32))(&mut msg, message, length as i32);
     game_fn!(0x20FC900, unsafe extern "C" fn(*mut Msg))(&mut msg);
     let read_byte = game_fn!(0x20FD050, unsafe extern "C" fn(*mut Msg) -> u8);
     if read_byte(&mut msg) != b'1' { return 0; }
     let kind = read_byte(&mut msg);
-    let Some(remaining) = msg.cur_size.checked_sub(msg.read_count) else { return 0; };
+    let Some(remaining) = packets::remaining_bytes(&msg) else { network_guard::record(Event::Envelope); return 0; };
     if msg.overflowed != 0 || remaining >= 2048 || [0x65, 0x6d].contains(&kind) { return 0; }
     if kind == 0x66 && (remaining != 0x64 || !memory::readable(msg.data as usize + msg.read_count as usize, 4) || read::<u32>(msg.data as usize + msg.read_count as usize) == 0) { return 0; }
     if kind == 0x68 && packets::check_pending_info(sender, &msg) { return 0; }
@@ -449,6 +509,181 @@ pub unsafe fn memory_patches(patches: &mut Vec<memory::Patch>) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn captured_bootstrap_reply_is_forwarded_with_native_overflow_flag() {
+        // Scalar metadata captured by control-v2 after the user's successful
+        // September2026 startup. Packet contents were not recorded.
+        let mut payload = [0u8; 19];
+        let msg = Msg {
+            overflowed: 1,
+            data: payload.as_mut_ptr(),
+            max_size: 19,
+            cur_size: 19,
+            split_size: 0,
+            read_count: 19,
+            bit: 0,
+            ..Msg::default()
+        };
+        assert!(!packets::valid_message(&msg)); // This was the erroneous v1 startup gate.
+        let calls = Cell::new(0);
+        assert!(!dispatch_connectionless(
+            b"connectResponse",
+            Some(&msg),
+            || panic!("bootstrap must not depend on mode"),
+            |_| panic!("bootstrap must not share the optional response-rate pool"),
+            || {
+                calls.set(calls.get() + 1);
+                false
+            },
+        ));
+        assert_eq!(calls.get(), 1);
+        assert_eq!((msg.overflowed, msg.read_count, msg.bit), (1, 19, 0));
+        assert_eq!(payload, [0u8; 19]);
+    }
+
+    #[test]
+    fn post_command_reader_state_does_not_block_startup_or_mode_transitions() {
+        let mut data = [0u8; 32];
+        let base = Msg {
+            data: data.as_mut_ptr(),
+            max_size: 32,
+            cur_size: 32,
+            ..Msg::default()
+        };
+        // Compatibility fixtures, not claimed captures: an exhausted/overflowed
+        // reader must not gate a command already tokenized by the native caller.
+        let states = [
+            Msg {
+                overflowed: 1,
+                read_count: 33,
+                ..base
+            },
+            Msg {
+                read_count: 33,
+                ..base
+            },
+            Msg { bit: 257, ..base },
+            Msg {
+                max_size: 0,
+                ..base
+            },
+        ];
+        for state in &states {
+            assert!(!packets::valid_message(state)); // Strict pre-read rules still apply elsewhere.
+            for command in [
+                b"connectResponse".as_slice(),
+                b"steamAuthReq",
+                b"LM",
+                b"fastrestart",
+                b"loadoutResponse",
+            ] {
+                let forwarded = Cell::new(0);
+                assert!(!dispatch_connectionless(
+                    command,
+                    Some(state),
+                    || panic!("common commands must not query the mode"),
+                    |_| panic!("startup/transition command must not use this rate pool"),
+                    || {
+                        forwarded.set(forwarded.get() + 1);
+                        false
+                    }
+                ));
+                assert_eq!(forwarded.get(), 1);
+                assert_eq!(data, [0u8; 32]);
+            }
+        }
+    }
+
+    #[test]
+    fn connectionless_compatibility_keeps_allowlist_campaign_and_rate_decisions() {
+        for campaign in [false, true] {
+            let called = Cell::new(false);
+            let result = dispatch_connectionless(
+                b"requeststats\n",
+                None,
+                || campaign,
+                |_| panic!("campaign stats must not use this rate pool"),
+                || {
+                    called.set(true);
+                    false
+                },
+            );
+            assert_eq!(called.get(), campaign);
+            assert_eq!(result, !campaign);
+        }
+        assert!(dispatch_connectionless(
+            b"unknown",
+            None,
+            || panic!("unknown command must not query the game"),
+            |_| panic!("unknown command must not reach admission"),
+            || panic!("unknown command reached native dispatch")
+        ));
+        let msg = Msg {
+            cur_size: 32,
+            max_size: 32,
+            read_count: 33,
+            ..Msg::default()
+        };
+        for allowed in [false, true] {
+            let forwarded = Cell::new(false);
+            let result = dispatch_connectionless(
+                b"infoResponse",
+                Some(&msg),
+                || panic!("known command must not query the mode"),
+                |bytes| {
+                    assert_eq!(bytes, 32);
+                    allowed
+                },
+                || {
+                    forwarded.set(true);
+                    false
+                },
+            );
+            assert_eq!(forwarded.get(), allowed);
+            assert_eq!(result, !allowed);
+        }
+    }
+
+    #[test]
+    fn control_limits_preserve_connection_and_mode_transition_commands() {
+        for command in [
+            b"connectResponse".as_slice(),
+            b"steamAuthReq",
+            b"keyAuthorize",
+            b"LM",
+            b"fastrestart",
+            b"loadoutResponse",
+            b"statresponse",
+            b"cfl",
+        ] {
+            assert!(LEGIT_PACKETS.contains(&command));
+            assert!(!limited_connectionless(command));
+        }
+        for command in [
+            b"requeststats".as_slice(),
+            b"REQUESTSTATS",
+            b"requeststats\n",
+        ] {
+            assert!(campaign_stats(command));
+            assert!(!limited_connectionless(command));
+            assert!(!LEGIT_PACKETS.contains(&command)); // Still Campaign-only, not admitted in MP/ZM.
+        }
+        for command in [
+            b"ping".as_slice(),
+            b"pinga",
+            b"infoResponse",
+            b"statusResponse",
+            b"error",
+            b"print",
+        ] {
+            assert!(LEGIT_PACKETS.contains(&command));
+            assert!(limited_connectionless(command));
+        }
+        assert!(!campaign_stats(b"requeststats\nextra"));
+        assert!(!LEGIT_PACKETS.contains(&b"unknown".as_slice()));
+    }
     #[test]
     fn model_path_boundaries() {
         assert!(valid_path(&[b'a'; 63]));

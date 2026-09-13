@@ -25,7 +25,7 @@ pub fn initialize(config: &Path) {
                 });
                 crate::memory::debug(&format!("Event journal: {}", path.display()));
                 event(format_args!(
-                    "session-start hang_tracking=v1 lobby_reader=validated-v2 game={:?} debug_assertions={}",
+                    "session-start hang_tracking=v1 lobby_reader=validated-v2 network_guard=control-v2 connectionless_reader=observe-v1 friend_retry=backoff-v1 game={:?} debug_assertions={}",
                     crate::game_build::current_build(),
                     cfg!(debug_assertions)
                 ));

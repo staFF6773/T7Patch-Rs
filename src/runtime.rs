@@ -98,7 +98,12 @@ impl State {
                 if memory::readable(slot, 4) {
                     memory::store(slot, random);
                 }
+                let mut last_network_report = std::time::Instant::now();
                 while !STOP.load(Ordering::Acquire) {
+                    if last_network_report.elapsed() >= std::time::Duration::from_secs(10) {
+                        crate::network_guard::report();
+                        last_network_report = std::time::Instant::now();
+                    }
                     if let Ok(mut state) = STATE.try_lock() {
                         if let Some(integrity) = &mut state.integrity {
                             let _pending = crate::profiling::INTEGRITY_MAINTAIN.track();

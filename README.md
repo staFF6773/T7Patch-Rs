@@ -42,6 +42,19 @@ Closing the launcher leaves an already installed patch active in the game. Reope
 
 The launcher has its own Rust-inspired charcoal and oxide-orange theme. **Settings**, **Updates**, and **Credits** tabs keep the interface compact, with game connection status always visible above them. Use the arrow keys while the tab strip is focused, or **Ctrl+Tab / Ctrl+Shift+Tab** from any tab, to switch sections. Hidden controls are excluded from keyboard navigation, and game detection and updates continue in the background. Native controls support visible focus and system DPI scaling. The header includes minimize and close controls; drag its empty area to move the window. **Credits** acknowledges Serious / shiversoftdev, Scroptss, T7Patch-Rs, and MinHook with links to their projects and references.
 
+## Network protection and frame-time stability
+
+The shared protection layer is enabled in **Campaign, Multiplayer and Zombies**, including their menus and lobbies. There is no mode-specific protection switch.
+
+- Message descriptors are checked for cursor/capacity inconsistencies, arithmetic overflow, missing buffers and invalid bit positions before the guarded lobby/IM readers run. Legitimate split buffers remain supported. At the connectionless command callback, where BO3 has already tokenized the command, the new reader-state checks are diagnostic-only to address a startup regression; the existing command filter still applies.
+- Bounded per-peer and global budgets limit social actions, instant messages, P2P control messages and selected connectionless responses. The connectionless budget excludes connection/authentication, lobby transport (`LM`), restart/loadout and Campaign stats commands. Other P2P packet classes keep their existing behavior.
+- Failed Steam friend refreshes use a **1–30 second exponential retry delay**, preserving the last complete snapshot. Successful refreshes retain the existing 30-second interval and original calling thread.
+- Rejection and failed-refresh counters are aggregated by the maintenance worker into `t7patch-events.log`, at most once every ten seconds. Network callbacks do not write individual packet logs.
+
+If the previous `control-v1` build stopped at a black screen during startup, restart BO3 and the launcher after rebuilding. The corrected build identifies itself in the event journal with **`network_guard=control-v2 connectionless_reader=observe-v1`**. See [startup regression diagnostics](docs/VALIDATION.md#startup-black-screen-after-control-v1).
+
+These changes target avoidable work and malformed control traffic, not a guaranteed FPS increase or complete coverage of BO3 vulnerabilities. **In-game compatibility and frame-time gains still require measurement in each mode**, especially joins, co-op, host migration and map changes. The limits do not authenticate an address/XUID or prevent Internet-link saturation. See [control-traffic budgets and validation](docs/VALIDATION.md#control-traffic-protection) and [performance diagnostics](docs/VALIDATION.md#performance-diagnostics).
+
 ## Launcher updates
 
 Starting with **v0.0.1**, the launcher checks the latest stable [GitHub Release](https://github.com/staFF6773/T7Patch-Rs/releases) when opened. **Check for updates** in the **Updates** tab repeats the check manually. Updates come from `staFF6773/T7Patch-Rs` over HTTPS without a GitHub login; a commit or temporary Actions artifact is not an update release.

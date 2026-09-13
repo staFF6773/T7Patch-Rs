@@ -1,11 +1,189 @@
 //! Bounded inspection of a copy of the game's lobby reader. The original cursor is never consumed.
 use crate::{
-    config, memory, protection,
+    config, memory,
+    network_guard::{self, Event},
+    protection,
     structs::{LobbyMsg, Msg},
 };
-use std::ffi::CStr;
+use std::{ffi::CStr, sync::Mutex};
 
 pub(crate) const LOBBY_HANDLE_IM_RVA: usize = 0x1EEA130;
+// Existing IM reader: two header bytes followed by strictly fewer than 2048 bytes.
+pub(crate) const MAX_INSTANT_BYTES: u32 = 2049;
+
+/// Validate arithmetic before accessing either payload buffer. BO3's native
+/// readers use signed 32-bit lengths, despite the unsigned ABI fields here.
+fn reader_layout(msg: &Msg) -> std::result::Result<u32, ReaderFault> {
+    if msg.overflowed != 0 {
+        return Err(ReaderFault::Overflowed);
+    }
+    if msg.cur_size > msg.max_size || msg.max_size > i32::MAX as u32 {
+        return Err(ReaderFault::Capacity);
+    }
+    let total = msg
+        .cur_size
+        .checked_add(msg.split_size)
+        .ok_or(ReaderFault::TotalLength)?;
+    if total > i32::MAX as u32 {
+        return Err(ReaderFault::TotalLength);
+    }
+    if msg.bit < 0 || msg.bit as u64 > u64::from(total) * 8 {
+        return Err(ReaderFault::BitCursor);
+    }
+    if (msg.cur_size != 0 && msg.data.is_null())
+        || (msg.split_size != 0 && msg.split_data.is_null())
+    {
+        return Err(ReaderFault::MissingBuffer);
+    }
+    (msg.data as usize)
+        .checked_add(msg.cur_size as usize)
+        .ok_or(ReaderFault::AddressOverflow)?;
+    (msg.split_data as usize)
+        .checked_add(msg.split_size as usize)
+        .ok_or(ReaderFault::AddressOverflow)?;
+    total
+        .checked_sub(msg.read_count)
+        .ok_or(ReaderFault::ReadCursor)
+}
+
+pub(crate) fn remaining_bytes(msg: &Msg) -> Option<u32> {
+    reader_layout(msg).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReaderFault {
+    DescriptorUnreadable,
+    Overflowed,
+    Capacity,
+    TotalLength,
+    BitCursor,
+    MissingBuffer,
+    AddressOverflow,
+    ReadCursor,
+    DataUnreadable,
+    SplitUnreadable,
+}
+const READER_FAULT_COUNT: usize = 10;
+
+#[derive(Clone, Copy)]
+enum ReaderStage {
+    Guarded,
+    Connectionless,
+}
+impl ReaderStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Guarded => "guarded-reader",
+            Self::Connectionless => "connectionless-post-command",
+        }
+    }
+}
+
+// Scalar-only metadata: do not retain game pointers, identifiers or packet contents.
+#[derive(Clone, Copy)]
+struct ReaderMetadata {
+    overflowed: u8,
+    capacity: u32,
+    current: u32,
+    split: u32,
+    read: u32,
+    bit: i32,
+}
+impl From<&Msg> for ReaderMetadata {
+    fn from(msg: &Msg) -> Self {
+        Self {
+            overflowed: msg.overflowed,
+            capacity: msg.max_size,
+            current: msg.cur_size,
+            split: msg.split_size,
+            read: msg.read_count,
+            bit: msg.bit,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct ReaderDiagnostic {
+    stage: ReaderStage,
+    fault: ReaderFault,
+    command: &'static str,
+    metadata: Option<ReaderMetadata>,
+}
+
+// At most one coherent snapshot per reason and stage in each report interval.
+static READER_DIAGNOSTICS: [Mutex<Option<ReaderDiagnostic>>; READER_FAULT_COUNT * 2] =
+    [const { Mutex::new(None) }; READER_FAULT_COUNT * 2];
+
+fn record_reader(stage: ReaderStage, command: &'static str, fault: ReaderFault, msg: Option<&Msg>) {
+    let slot = &READER_DIAGNOSTICS[stage as usize * READER_FAULT_COUNT + fault as usize];
+    if let Ok(mut sample) = slot.try_lock() {
+        if sample.is_none() {
+            *sample = Some(ReaderDiagnostic {
+                stage,
+                fault,
+                command,
+                metadata: msg.map(ReaderMetadata::from),
+            });
+        }
+    }
+}
+
+fn check_reader(msg: &Msg) -> std::result::Result<u32, ReaderFault> {
+    let remaining = reader_layout(msg)?;
+    if msg.cur_size != 0 && !memory::readable(msg.data as usize, msg.cur_size as usize) {
+        return Err(ReaderFault::DataUnreadable);
+    }
+    if msg.split_size != 0 && !memory::readable(msg.split_data as usize, msg.split_size as usize) {
+        return Err(ReaderFault::SplitUnreadable);
+    }
+    Ok(remaining)
+}
+
+/// CL_ConnectionlessCMD runs AFTER native command tokenization. Its reader state
+/// must not be gated by assumptions made for readers we are about to consume.
+/// Observe the old predicate to diagnose the startup regression, without changing
+/// the descriptor or bypassing the command allowlist and control-rate policies.
+pub(crate) fn observe_connectionless(msg: Option<&Msg>, command: &'static str) {
+    let fault = msg.map_or(Some(ReaderFault::DescriptorUnreadable), |msg| {
+        check_reader(msg).err()
+    });
+    if let Some(fault) = fault {
+        record_reader(ReaderStage::Connectionless, command, fault, msg);
+    }
+}
+
+pub(crate) fn report_reader_diagnostics() {
+    for slot in &READER_DIAGNOSTICS {
+        // Release the lock before any journal I/O.
+        let sample = slot.lock().ok().and_then(|mut sample| sample.take());
+        if let Some(sample) = sample {
+            if let Some(msg) = sample.metadata {
+                crate::diagnostics::event(format_args!(
+                    "reader-diagnostic stage={} action={} reason={:?} command={} overflowed={} capacity={} cursize={} split={} readcount={} bit={}",
+                    sample.stage.label(), if matches!(sample.stage, ReaderStage::Connectionless) { "observe" } else { "reject" },
+                    sample.fault, sample.command, msg.overflowed, msg.capacity, msg.current, msg.split, msg.read, msg.bit,
+                ));
+            } else {
+                crate::diagnostics::event(format_args!(
+                    "reader-diagnostic stage={} action=observe reason={:?} command={} metadata=unavailable",
+                    sample.stage.label(), sample.fault, sample.command,
+                ));
+            }
+        }
+    }
+}
+
+/// The descriptor and its buffers must remain live throughout the game callback.
+/// Split readers are supported rather than rejecting legitimate fragmented data.
+pub(crate) fn valid_message(msg: &Msg) -> bool {
+    match check_reader(msg) {
+        Ok(_) => true,
+        Err(fault) => {
+            network_guard::record(Event::Envelope);
+            record_reader(ReaderStage::Guarded, "n/a", fault, Some(msg));
+            false
+        }
+    }
+}
 // Verified from the live September2026 call at LobbyMsg_HandleIM+0x20:
 // E8 9B 03 00 00 -> RVA 0x1EE9E30. In the baseline address map this is
 // 0x1EEA4F0, NOT 0x1EEA150 (which is the call instruction itself).
@@ -449,6 +627,10 @@ pub unsafe fn inspect(msg: *mut LobbyMsg) {
         return;
     }
     let mut copy = msg.read_unaligned();
+    if !valid_message(&copy.msg) {
+        std::ptr::addr_of_mut!((*msg).msg_type).write_unaligned(0xff);
+        return;
+    }
     let kind = copy.msg_type;
     let mut engine = Engine { msg: &mut copy };
     let result = match kind {
@@ -460,17 +642,17 @@ pub unsafe fn inspect(msg: *mut LobbyMsg) {
         _ => return,
     };
     if result.is_err() || copy.msg.overflowed != 0 {
+        network_guard::record(Event::Lobby);
         std::ptr::addr_of_mut!((*msg).msg_type).write_unaligned(0xff);
     }
 }
 
 pub unsafe fn check_pending_info(sender: u64, msg: &Msg) -> bool {
+    if !valid_message(msg) {
+        return true;
+    }
     let mut copy = *msg;
-    let Some(size) = copy
-        .cur_size
-        .checked_sub(copy.read_count)
-        .filter(|&size| size < 2048)
-    else {
+    let Some(size) = remaining_bytes(&copy).filter(|&size| size < 2048) else {
         return true;
     };
     let mut data = [0u8; 2048];
@@ -489,6 +671,9 @@ pub unsafe fn check_pending_info(sender: u64, msg: &Msg) -> bool {
     )(&mut lobby, data.as_mut_ptr(), size as i32)
         == 0
     {
+        return true;
+    }
+    if !valid_message(&lobby.msg) {
         return true;
     }
     if lobby.msg_type == 1 {
@@ -517,6 +702,219 @@ pub unsafe fn check_pending_info(sender: u64, msg: &Msg) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_diagnostics_distinguish_flags_capacity_and_consumed_cursors() {
+        let mut data = [0u8; 8];
+        let msg = Msg {
+            data: data.as_mut_ptr(),
+            cur_size: 8,
+            max_size: 8,
+            ..Msg::default()
+        };
+        for (changed, reason) in [
+            (
+                Msg {
+                    overflowed: 1,
+                    read_count: 9,
+                    ..msg
+                },
+                ReaderFault::Overflowed,
+            ),
+            (Msg { max_size: 0, ..msg }, ReaderFault::Capacity),
+            (
+                Msg {
+                    read_count: 9,
+                    ..msg
+                },
+                ReaderFault::ReadCursor,
+            ),
+            (Msg { bit: 65, ..msg }, ReaderFault::BitCursor),
+            (
+                Msg {
+                    data: std::ptr::null_mut(),
+                    ..msg
+                },
+                ReaderFault::MissingBuffer,
+            ),
+        ] {
+            assert_eq!(reader_layout(&changed), Err(reason));
+            let snapshot = ReaderMetadata::from(&changed);
+            assert_eq!(snapshot.capacity, changed.max_size);
+            assert_eq!(snapshot.read, changed.read_count);
+            assert_eq!(snapshot.bit, changed.bit);
+            assert_eq!(snapshot.overflowed, changed.overflowed);
+        }
+    }
+
+    #[test]
+    fn split_reader_bounds_and_empty_messages() {
+        let mut first = [0u8; 4];
+        let mut second = [0u8; 8];
+        let mut msg = Msg {
+            data: first.as_mut_ptr(),
+            split_data: second.as_mut_ptr(),
+            max_size: 4,
+            cur_size: 4,
+            split_size: 8,
+            read_count: 6,
+            bit: 48,
+            ..Msg::default()
+        };
+        assert_eq!(remaining_bytes(&msg), Some(6));
+        assert!(valid_message(&msg));
+        msg.read_count = 12;
+        msg.bit = 96;
+        assert_eq!(remaining_bytes(&msg), Some(0));
+        msg.read_count = 13;
+        assert_eq!(remaining_bytes(&msg), None);
+        assert_eq!(remaining_bytes(&Msg::default()), Some(0));
+    }
+
+    #[test]
+    fn malformed_envelopes_are_rejected_before_native_readers() {
+        let mut data = [0u8; 16];
+        let good = Msg {
+            data: data.as_mut_ptr(),
+            max_size: 16,
+            cur_size: 16,
+            ..Msg::default()
+        };
+        let cases = [
+            Msg {
+                overflowed: 1,
+                ..good
+            },
+            Msg {
+                cur_size: 17,
+                ..good
+            },
+            Msg {
+                read_count: 17,
+                ..good
+            },
+            Msg { bit: -1, ..good },
+            Msg { bit: 129, ..good },
+            Msg {
+                max_size: u32::MAX,
+                ..good
+            },
+            Msg {
+                data: std::ptr::null_mut(),
+                ..good
+            },
+            Msg {
+                data: usize::MAX as *mut u8,
+                ..good
+            },
+            Msg {
+                split_size: 1,
+                ..good
+            },
+            Msg {
+                split_size: u32::MAX,
+                split_data: data.as_mut_ptr(),
+                ..good
+            },
+            Msg {
+                split_size: i32::MAX as u32,
+                split_data: data.as_mut_ptr(),
+                ..good
+            },
+        ];
+        for msg in cases {
+            assert_eq!(remaining_bytes(&msg), None);
+            let mut lobby = LobbyMsg {
+                msg,
+                msg_type: 0x10,
+                ..LobbyMsg::default()
+            };
+            unsafe {
+                inspect(&mut lobby);
+            }
+            assert_eq!(lobby.msg_type, 0xff);
+            assert!(unsafe { check_pending_info(7, &msg) });
+        }
+        // Structurally valid but inaccessible data must also be rejected before game_fn!.
+        let msg = Msg {
+            data: std::ptr::dangling_mut::<u8>(),
+            ..good
+        };
+        assert!(remaining_bytes(&msg).is_some());
+        assert!(!valid_message(&msg));
+    }
+
+    #[test]
+    fn unhandled_message_types_keep_original_cursor_and_payload() {
+        let mut data = [1u8, 2, 3, 4];
+        let mut lobby = LobbyMsg {
+            msg: Msg {
+                data: data.as_mut_ptr(),
+                max_size: 4,
+                cur_size: 4,
+                read_count: 1,
+                bit: 8,
+                ..Msg::default()
+            },
+            msg_type: 4,
+            ..LobbyMsg::default()
+        };
+        unsafe {
+            inspect(&mut lobby);
+        }
+        assert_eq!(lobby.msg_type, 4);
+        assert_eq!(lobby.msg.read_count, 1);
+        assert_eq!(lobby.msg.bit, 8);
+        assert_eq!(data, [1, 2, 3, 4]);
+    }
+
+    struct Truncated {
+        fail_at: usize,
+        calls: usize,
+    }
+    impl Truncated {
+        fn read(&mut self) -> Result<u64> {
+            let position = self.calls;
+            self.calls += 1;
+            if position == self.fail_at {
+                Err(())
+            } else {
+                Ok(0)
+            }
+        }
+    }
+    impl Wire for Truncated {
+        fn field(&mut self, _: Kind, _: &CStr) -> Result<u64> {
+            self.read()
+        }
+        fn array(&mut self, _: &CStr) -> Result {
+            self.read().map(|_| ())
+        }
+        fn element(&mut self, _: bool) -> bool {
+            false
+        }
+        fn mutable_client(&mut self) -> Result {
+            self.read().map(|_| ())
+        }
+    }
+    #[test]
+    fn truncated_fields_stop_inspection_immediately() {
+        type Inspector = fn(&mut Truncated) -> Result;
+        let inspectors: [(Inspector, usize); 3] = [(join, 21), (heartbeat, 4), (info_response, 4)];
+        for (inspect, calls) in inspectors {
+            let mut valid = Truncated {
+                fail_at: usize::MAX,
+                calls: 0,
+            };
+            assert!(inspect(&mut valid).is_ok());
+            assert_eq!(valid.calls, calls);
+            for fail_at in 0..calls {
+                let mut wire = Truncated { fail_at, calls: 0 };
+                assert!(inspect(&mut wire).is_err());
+                assert_eq!(wire.calls, fail_at + 1);
+            }
+        }
+    }
     // Captured with ReadProcessMemory from the user's September2026 executable,
     // not reconstructed from the port's old address constants.
     const HANDLE_IM_CAPTURE: &[u8] = &[

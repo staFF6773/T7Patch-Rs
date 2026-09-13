@@ -3,6 +3,7 @@ use crate::{
     game_build::address,
     hooks,
     memory::{self, bounded_string, read, Patch},
+    network_guard::{self, Channel, Event, Peer},
     packets,
     structs::*,
 };
@@ -23,12 +24,14 @@ struct Friends {
     next: u64,
     xuids: HashSet<u64>,
     refreshing: bool,
+    failures: u32,
 }
 static FRIENDS: LazyLock<Mutex<Friends>> = LazyLock::new(|| {
     Mutex::new(Friends {
         next: 0,
         xuids: HashSet::new(),
         refreshing: false,
+        failures: 0,
     })
 });
 static DLC: LazyLock<Mutex<HashMap<i32, bool>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -56,7 +59,7 @@ pub unsafe fn is_friend(xuid: u64) -> bool {
         xuid,
         now,
         read::<u8>(address(0x1686E99E)) != 0,
-        || fetch_friends().map(|friends| (friends, GetTickCount64())),
+        || (fetch_friends(), GetTickCount64()),
     )
 }
 
@@ -65,7 +68,7 @@ fn cached_friend(
     xuid: u64,
     now: u64,
     can_refresh: bool,
-    fetch: impl FnOnce() -> Option<(HashSet<u64>, u64)>,
+    fetch: impl FnOnce() -> (Option<HashSet<u64>>, u64),
 ) -> bool {
     {
         let mut friends = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -84,11 +87,19 @@ fn cached_friend(
         }
     }
     let _refresh = Refresh(cache);
-    let result = fetch();
+    let (result, completed) = fetch();
     let mut friends = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((snapshot, completed)) = result {
+    if let Some(snapshot) = result {
         friends.xuids = snapshot;
         friends.next = completed.saturating_add(30000);
+        friends.failures = 0;
+    } else {
+        // Keep the last complete snapshot and the original Steam-calling thread.
+        // A failed Steam query must not be retried by every inbound invitation.
+        friends.failures = friends.failures.saturating_add(1);
+        let delay = (1000u64 << friends.failures.saturating_sub(1).min(5)).min(30000);
+        friends.next = completed.max(now).saturating_add(delay);
+        network_guard::record(Event::FriendsRetry);
     }
     friends.xuids.contains(&xuid)
 }
@@ -168,16 +179,29 @@ steam_hook!(download(object: usize, item: i32, done: *mut i64, total: *mut i64) 
 });
 steam_hook!(create_lobby(object: usize, _kind: i32, max_players: i32) -> u64, |original| { original(object, 1, max_players) });
 steam_hook!(read_p2p(object: usize, dest: *mut u8, capacity: u32, size: *mut u32, remote: *mut u64, channel: i32) -> bool, |original| {
+    if dest.is_null() || size.is_null() || remote.is_null() { return false; }
     let result = original(object, dest, capacity, size, remote, channel);
-    if result && !size.is_null() && size.read_unaligned() > 5 {
-        if size.read_unaligned() > capacity || !memory::readable(dest as usize, 6) { return false; }
-        match *dest.add(5) {
-            104 => if remote.is_null() || !allow_friend(remote.read_unaligned()) { return false; },
-            102 | 101 | 109 => return false,
-            _ => {}
+    if !result { return false; }
+    let received = size.read_unaligned();
+    // Validate even 0..5-byte packets: the old size check only ran after the header.
+    if received > capacity || (received > 5 && !memory::readable(dest as usize, 6)) {
+        network_guard::record(Event::P2p);
+        size.write_unaligned(0);
+        return false;
+    }
+    if received > 5 {
+        let blocked = match *dest.add(5) {
+            104 => !network_guard::allow(Channel::P2pControl, Peer::Steam(remote.read_unaligned()), received)
+                || !allow_friend(remote.read_unaligned()),
+            102 | 101 | 109 => true,
+            _ => false,
+        };
+        if blocked {
+            size.write_unaligned(0);
+            return false;
         }
     }
-    result
+    true
 });
 steam_hook!(chat(object: usize, lobby: u64, chat_id: i32, user: *mut u64, data: *mut u8, capacity: i32, entry_type: *mut i32) -> i32, |original| {
     let result = original(object, lobby, chat_id, user, data, capacity, entry_type);
@@ -378,6 +402,7 @@ mod tests {
             next: 0,
             xuids: HashSet::from([7]),
             refreshing: false,
+            failures: 0,
         })
     }
 
@@ -401,7 +426,7 @@ mod tests {
                     .join()
                     .unwrap());
             });
-            Some((HashSet::from([9]), 20))
+            (Some(HashSet::from([9])), 20)
         }));
         assert!(!cached_friend(&cache, 7, 21, true, || panic!(
             "premature refresh"
@@ -415,17 +440,96 @@ mod tests {
     #[test]
     fn failed_friend_refresh_preserves_snapshot_and_can_retry() {
         let cache = cache();
-        assert!(cached_friend(&cache, 7, 10, true, || None));
+        assert!(cached_friend(&cache, 7, 10, true, || (None, 20)));
         assert!(!cache.lock().unwrap().refreshing);
         assert!(cached_friend(&cache, 7, 10, false, || panic!(
             "in-game refresh"
         )));
-        assert!(cached_friend(&cache, 9, 11, true, || Some((
-            HashSet::from([9]),
-            11
-        ))));
-        assert!(!cached_friend(&cache, 7, 12, true, || panic!(
+        assert!(!cached_friend(&cache, 9, 1019, true, || panic!(
+            "retry before cooldown"
+        )));
+        assert!(cached_friend(&cache, 9, 1020, true, || (
+            Some(HashSet::from([9])),
+            1020
+        )));
+        assert!(!cached_friend(&cache, 7, 1021, true, || panic!(
             "premature refresh"
         )));
+        assert_eq!(cache.lock().unwrap().failures, 0);
+    }
+
+    #[test]
+    fn failed_friend_refresh_backs_off_from_completion_and_caps_retries() {
+        let cache = cache();
+        let mut now = 0;
+        for delay in [1000, 2000, 4000, 8000, 16000, 30000, 30000] {
+            // A slow failed Steam call is not followed by an immediate retry.
+            let completed = now + 5000;
+            assert!(cached_friend(&cache, 7, now, true, || (None, completed)));
+            let next = completed + delay;
+            assert_eq!(cache.lock().unwrap().next, next);
+            assert!(!cached_friend(&cache, 9, next - 1, true, || panic!(
+                "premature retry"
+            )));
+            now = next;
+        }
+        assert!(cached_friend(&cache, 9, now, true, || (
+            Some(HashSet::from([9])),
+            now
+        )));
+        now += 30000;
+        assert!(cached_friend(&cache, 9, now, true, || (None, now)));
+        assert_eq!(cache.lock().unwrap().next, now + 1000);
+    }
+
+    #[test]
+    fn p2p_rejects_short_oversized_results_and_preserves_unrelated_packets() {
+        unsafe extern "C" fn receive(
+            _: usize,
+            dest: *mut u8,
+            _: u32,
+            size: *mut u32,
+            remote: *mut u64,
+            channel: i32,
+        ) -> bool {
+            *size = channel as u32;
+            *remote = 7;
+            *dest.add(5) = 0; // An unrelated packet class, not subject to control admission.
+            true
+        }
+        let previous = read_p2p::ORIGINAL.swap(receive as *const () as usize, Ordering::AcqRel);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                read_p2p::ORIGINAL.store(self.0, Ordering::Release);
+            }
+        }
+        let _restore = Restore(previous);
+        let mut dest = [0u8; 8];
+        let mut size = 0;
+        let mut remote = 0;
+        for (capacity, received, allowed) in [
+            (4, 5, false),
+            (0, 1, false),
+            (4, 4, true),
+            (8, 8, true),
+            (8, 9, false),
+        ] {
+            let result = unsafe {
+                read_p2p::detour(
+                    0,
+                    dest.as_mut_ptr(),
+                    capacity,
+                    &mut size,
+                    &mut remote,
+                    received,
+                )
+            };
+            assert_eq!(result, allowed);
+            assert_eq!(size, if allowed { received as u32 } else { 0 });
+        }
+        assert!(!unsafe {
+            read_p2p::detour(0, std::ptr::null_mut(), 8, &mut size, &mut remote, 8)
+        });
     }
 }

@@ -15,6 +15,7 @@ pub mod hashing;
 mod hooks;
 pub mod launcher_api;
 mod minhook;
+mod network_guard;
 mod packets;
 mod profiling;
 mod protection;

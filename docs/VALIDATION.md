@@ -165,6 +165,58 @@ UI smoke mode does not demonstrate in-game activation. The launcher protocol dis
 
 These corrections affect protocol cases that the C++ handled inconsistently. Interoperability with another player using the C++ version must be checked, especially when changing the password during a session.
 
+## Control-traffic protection
+
+The `network_guard=control-v2` layer shares the same admission policies in Campaign, Multiplayer and Zombies. It adds no renderer hook or new native game entry point, and preserves the existing Campaign `requeststats` exception. It does not change packet serialization or the network-password format. The original `control-v1` pre-read predicate is no longer enforced at the already-tokenized connectionless command callback; see the startup regression below.
+
+### Admission budgets
+
+These are initial conservative control-traffic budgets, **not limits calibrated from live BO3 traffic**. Each pool has two seconds of burst credit. Byte units below are binary KiB/MiB; social calls have no byte count available.
+
+| Pool | Per peer / second | Global / second | Applied to |
+| --- | --- | --- | --- |
+| Social | 8 calls | 128 calls | Accept-invite, join-message actions and send-join-info callbacks |
+| Instant | 128 messages, 256 KiB | 4096 messages, 8 MiB | Guarded instant-message dispatcher |
+| P2P control | 256 messages, 1 MiB | 8192 messages, 32 MiB | P2P type `104` only |
+| Connectionless | 128 messages, 256 KiB | 4096 messages, 8 MiB | `infoResponse`, `statusResponse`, `print`, `error`, `ping`, `pinga` |
+
+Other connectionless commands retain the existing allowlist policy. In particular, `connectResponse`, `steamAuthReq`, `keyAuthorize`, `LM`, `fastrestart`, `loadoutResponse`, `statresponse`, `cfl` and Campaign-only stats requests do not use the connectionless budget. This does not bypass any earlier IM/P2P guard through which their transport may pass.
+
+Each pool owns a fixed 256-entry peer table. Idle entries can be reused after 30 seconds; new identities cannot evict active ones and replenish their burst credit. No heap allocation, Steam calls, or disk writes occur while an admission mutex is held. Global budgets charge attempts before the table scan, including attempts subsequently rejected by the per-peer budget. This bounds table work during identity churn, but sustained floods can exhaust the shared pool and temporarily affect legitimate control messages. IP addresses and supplied XUIDs are keys for accounting, not proof of authentication.
+
+### Early message checks
+
+- Instant-message lengths outside 2–2049 bytes are rejected before memory queries or native parsing, matching the existing two-byte header and strictly-less-than-2048-byte payload bound.
+- Before the guarded lobby/IM readers run, descriptors reject overflow flags, cursors beyond the combined buffers, sizes outside native signed-length limits, null nonempty buffers, address arithmetic overflow, and bit cursors outside the payload. Both primary and split buffers are checked for readability at those boundaries. Connectionless command dispatch observes this predicate without enforcing it, since its native caller has already consumed command data. These checks require live engine-owned allocations; they do not make concurrent buffer destruction safe.
+- Invalid lobby descriptors are marked as rejected before the inspector invokes game readers. Valid message types outside the existing inspection set retain their cursor and payload.
+- P2P return sizes are checked against capacity even for packets shorter than the six-byte discriminator header. A rejected successful read clears its reported size.
+
+### Friend-cache retry behavior
+
+The existing Steam-calling thread and refresh eligibility are preserved. Failed refreshes retain the complete previous snapshot and retry after 1, 2, 4, 8, 16, then at most 30 seconds. The delay starts after the failed call completes, and success resets the failure count. Concurrent/reentrant callers still use the previous snapshot. This prevents repeated failed queries from being driven by every inbound social action; it does not move a successful enumeration off-thread or change snapshot invalidation semantics.
+
+### Verification and interpretation
+
+Automated checks cover token refill, byte budgets, burst exhaustion, backward clocks, fixed-table capacity/expiry, concurrent calls sharing a budget, an 18-peer synthetic control stream, connection/Campaign-command exclusions, split-buffer arithmetic, malformed descriptors rejected without native calls, early field-read failures, P2P short/oversized return values, and retry backoff from completion. The structured wire tests are not a substitute for fuzzing BO3's native serializers.
+
+The normal event journal includes `network_guard=control-v2 connectionless_reader=observe-v1 friend_retry=backoff-v1`. Nonzero counters are written in a `network-guard` summary at most every ten seconds by the existing maintenance worker. `*_limited` counts admission rejections; `friends_refresh_failed` counts failed refreshes, not blocked packets. No packet contents, peer identities, addresses or passwords are written by these summaries. A blocked maintenance worker can delay them.
+
+Before calling a mode validated, record clean and malformed-traffic tests in an isolated session: Campaign solo/co-op and checkpoints, MP lobby/join/respawn/map rotation, and Zombies solo/co-op/start/restart/return to menu. Include invitations, reconnects, host migration, matching passwords and the supported executable builds. Compare frame-time distributions in the same scenario before/after this layer and inspect the summary counters for unintended admission limits. Neither live mode compatibility, native-parser fuzz coverage, nor an FPS gain is established by the synthetic tests.
+
+### Startup black screen after control-v1
+
+A local September2026 session with `control-v1` remained at a black screen after loading. Read-only inspection found an active game process and installed DLL, continuing profile reports, approximately 3–4 `envelope` rejections per ten seconds and connectionless calls at the same cadence. Rate-limit and failed-friend-refresh counters stayed at zero. The existing fatal crash log belonged to an older session; no new fatal/suspension event was recorded in this one.
+
+This implicated the newly enforced reader-state check at `CL_ConnectionlessCMD`, which runs after native command tokenization. The v1 journal recorded only an aggregate rejection count, so the precise rejected field was initially unknown.
+
+`control-v2` restores the earlier dispatch behavior at this callback: the command allowlist, Campaign exception and selected control-rate policies decide admission, while the new descriptor predicate is observation-only. The guard still enforces the predicate before the lobby/IM reads it performs itself. It does not reset or repair a game-owned cursor to make it pass validation.
+
+The maintenance worker now writes `reader-diagnostic` samples with stage, `action=observe` or `action=reject`, fault category, a fixed allowlisted command label, and scalar fields (`overflowed`, `capacity`, `cursize`, `split`, `readcount`, `bit`). An unreadable descriptor produces `metadata=unavailable`. The callback uses a nonblocking snapshot slot; there is at most one snapshot per fault category and stage per ten-second report interval (20 slots total). There are no packet bytes, memory addresses, player identifiers or passwords in these samples.
+
+After replacing the binaries and restarting, the user confirmed that the main menu appeared. The new journal captured `stage=connectionless-post-command action=observe reason=Overflowed command=connectResponse overflowed=1 capacity=19 cursize=19 split=0 readcount=19 bit=0`. This identifies the v1 predicate that rejected the bootstrap response: the overflow flag is present at this post-tokenization callback even though the cursor equals the payload length. The fix leaves that native state untouched and forwards the allowlisted command.
+
+A regression test retains those captured scalar values (not the packet contents), alongside synthetic post-command overflow/cursor/capacity cases, original return-value forwarding, unchanged command rejection, Campaign-only stats and rate admission. Startup to the menu is confirmed for this local September2026 run; complete Campaign/MP/Zombies sessions and other executable builds still need the checks above. Restart both processes when replacing the DLL and verify the new session header before interpreting its diagnostics.
+
 ## Performance diagnostics
 
 For an FPS regression, first close BO3 and the launcher, run `scripts/build.ps1`, and launch `dist/t7patch.exe`. The script packages **Release** binaries together; plain `cargo build` creates Debug binaries and does not replace the DLL in `dist`. An active DLL with debug assertions enabled now identifies itself in the launcher's status text.
