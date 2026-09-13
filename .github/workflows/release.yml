@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Verify and package Windows update
+    runs-on: windows-2022
+    timeout-minutes: 25
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      CARGO_TERM_COLOR: always
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify release version
+        run: |
+          $metadata = & cargo metadata --no-deps --format-version 1 --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata | ConvertFrom-Json).packages[0].version
+          if ($version -notmatch '^\d+\.\d+\.\d+$' -or $env:RELEASE_TAG -ne "v$version") {
+              throw 'Tag must be v<Cargo.toml version>, without prerelease/build suffixes.'
+          }
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+      - run: cargo test --all-targets --locked --target x86_64-pc-windows-msvc
+      - run: cargo test --doc --locked --target x86_64-pc-windows-msvc
+      - run: '& .\scripts\build.ps1'
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc --examples
+      - name: Check DLL and remote loader
+        run: |
+          & '.\target\x86_64-pc-windows-msvc\release\examples\smoke.exe' '.\dist\t7patch.dll'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\target\x86_64-pc-windows-msvc\release\examples\loader_smoke.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check update helper and successor launch
+        run: '& .\scripts\test-update.ps1'
+      - name: Check launcher window
+        run: |
+          $process = Start-Process -FilePath '.\dist\t7patch.exe' -ArgumentList '--ui-smoke-test' -PassThru
+          try {
+              if (-not $process.WaitForExit(30000)) { $process.Kill(); throw 'UI smoke test timed out.' }
+              if ($process.ExitCode -ne 0) { throw 'UI smoke test failed.' }
+          } finally { $process.Dispose() }
+      - name: Package ZIP and update manifest
+        run: '& .\scripts\package-release.ps1'
+      - name: Validate published package with the updater
+        run: cargo run --release --locked --target x86_64-pc-windows-msvc --bin t7patch-launcher -- --verify-update-package target/release-package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: |
+            target/release-package/t7patch-windows-x64.zip
+            target/release-package/update.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish complete GitHub Release
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: package
+      - name: Upload assets before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true || {
+              echo 'This release is already public; publish fixes with a new version.' >&2
+              exit 1
+            }
+            gh release upload "$RELEASE_TAG" package/t7patch-windows-x64.zip package/update.json --clobber
+          else
+            gh release create "$RELEASE_TAG" package/t7patch-windows-x64.zip package/update.json \
+              --verify-tag --draft --title "T7 Patch Rust $RELEASE_TAG" --generate-notes
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest

@@ -42,14 +42,38 @@ The manual workflow runs:
 1. Release packaging through `scripts/build.ps1` and compilation of the smoke-test examples.
 2. The original DLL API smoke test against the packaged DLL.
 3. Remote loading and bootstrap replies in the dedicated `launcher_host.exe` process.
-4. Launcher creation and shutdown using `--ui-smoke-test`, with a 30-second process timeout.
-5. Artifact upload after all build and smoke-test steps succeed.
+4. Update-helper replacement/relaunch check in a temporary installation.
+5. Launcher creation and shutdown using `--ui-smoke-test`, with a 30-second process timeout.
+6. Artifact upload after all build and smoke-test steps succeed.
 
 The artifact is named `t7patch-windows-x64`, contains the packaged EXE and DLL, and is retained for 14 days. Both workflows use read-only repository permissions and cache Rust dependencies. The manual build runs independently of the automatic check workflow.
 
 The UI lifecycle check does not capture the desktop or start game detection. Screenshot inspection remains a local check. CI does not launch BO3 or validate Wine/Proton, and a successful run does not establish that the in-game patch works.
 
 ## Automated checks
+
+### Updater checks
+
+The updater tests cover stable semantic-version ordering, missing/duplicate assets, invalid manifests, corrupted ZIPs, unexpected ZIP paths, cancellation, Windows x64 binary validation, preserving configuration, restoring the old EXE after a DLL replacement fails, and recovering an interrupted transaction. The locked-DLL regression holds a real Windows file handle that denies deletion. A corrupted backup is rejected before either file is restored. Network requests are disabled in normal tests and in `--ui-smoke-test`.
+
+The optional native WinHTTP check uses the public GitHub endpoint:
+
+```powershell
+cargo test --locked --target x86_64-pc-windows-msvc --bin t7patch-launcher github_update_endpoint_smoke -- --ignored --nocapture
+```
+
+For an end-to-end helper check, close BO3 and the launcher, build Release and the examples, then run:
+
+```powershell
+cargo build --release --locked --target x86_64-pc-windows-msvc --examples
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-update.ps1
+```
+
+This runs a copy of the real updater helper in a temporary directory under `target`, replaces a fixture EXE/DLL pair and launches the harmless `update_host` successor. The successor only writes a marker and exits; it never loads the patch or searches for BO3. Configuration and installed hashes are verified and the fixture directory is removed. This checks the Windows helper/relaunch path; downloading two published production versions cannot be tested until matching Releases exist.
+
+The tag-triggered [Release workflow](../.github/workflows/release.yml) performs those offline checks and validates the final ZIP/manifest through `--verify-update-package`. Only its publication job has `contents: write`; build and test jobs retain read-only repository access. Version mismatches fail before publication. Drafts are published after both assets upload successfully; re-runs may complete an existing draft but do not replace an already public Release.
+
+### Patch and loader checks
 
 - PE fingerprints for both builds and RVA translation boundaries.
 - Sizes, alignment, and offsets of message, session, and Steam structures.

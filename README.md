@@ -40,6 +40,34 @@ Closing the launcher leaves an already installed patch active in the game. Reope
 
 The UI follows the dark style and controls of the reference screenshot. Its footer credits the original author, and `Learn more` opens the original T7 Patch repository.
 
+## Launcher updates
+
+Starting with **v0.2.0**, the launcher checks the latest stable [GitHub Release](https://github.com/staFF6773/T7Patch-Rs/releases) when opened. **Check for updates** repeats the check manually. Updates come from `staFF6773/T7Patch-Rs` over HTTPS without a GitHub login; a commit or temporary Actions artifact is not an update release.
+
+1. When a newer version is available, click **Download update**. The interface displays download progress while normal game detection continues.
+2. The package's sizes, SHA-256 hashes, platform and EXE/DLL structure are checked before installation. Once verified, close BO3 and click **Install & restart**.
+3. The launcher saves pending settings, pauses injection, and starts a temporary helper. The helper waits for the launcher to exit, replaces the EXE and DLL together, then restarts the launcher. **`t7patch.conf` is preserved.**
+
+Downloads are staged in the installation directory. A recovery journal and backups let the helper restore the previous pair if a replacement fails; interrupted installations are recovered on the next startup before game detection. Files still in use or an unwritable installation directory produce an error. Recovery keeps its journal/backups if restoration cannot complete. Helper failures are shown in a dialog, and transaction errors are recorded in `t7patch-update.log`.
+
+With no published Releases, the launcher displays **No published update releases yet**. Offline checks and GitHub rate limits leave the installed patch usable. Only stable versions newer than the installed Cargo version are offered. The first version containing the updater must be installed manually. The updater uses Windows APIs; Wine/Proton runtime validation remains pending.
+
+### Publishing an update
+
+1. Set a new stable version in `Cargo.toml` and update `Cargo.lock` with Cargo. Commit and push the changes.
+2. Publish a matching tag, for example `v0.2.0` for version `0.2.0`.
+3. The **Release** workflow verifies the version, runs checks, builds and tests the Windows binaries, and creates `t7patch-windows-x64.zip` plus `update.json`.
+4. It uploads both assets to a draft Release before making it public. Existing public Releases are not overwritten; publish a new version for changes.
+
+The archive contains only `t7patch.exe` and `t7patch.dll`. The schema-1 manifest records the version, `x86_64-pc-windows-msvc` target, archive hash/size and each binary's hash/size. To produce and verify the assets locally after building:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
+cargo run --release --locked --target x86_64-pc-windows-msvc --bin t7patch-launcher -- --verify-update-package target/release-package
+```
+
+Output is in `target/release-package`. Creating or pushing a tag and publishing the first Release are separate from implementing the updater.
+
 ## Linux / Steam Deck setup
 
 These instructions run the **Windows launcher and DLL through Wine/Proton**. They describe the intended setup; this port has not yet been validated inside BO3 on Linux.
@@ -216,12 +244,13 @@ As in the original, integrity patches remain until process exit after a successf
 
 ### GitHub Actions
 
-Two independent workflows use Windows Server 2022 with the stable Rust toolchain and the x64 MSVC target:
+Three workflows verify Windows builds with the stable Rust toolchain and the x64 MSVC target. Release publication uses a separate Ubuntu job after the Windows checks pass:
 
 | Workflow | Trigger | What it does |
 | --- | --- | --- |
 | [CI](.github/workflows/ci.yml) | Every push to a branch and every pull request | Checks formatting, Clippy with warnings denied, all-target tests, and documentation tests |
 | [Build](.github/workflows/build.yml) | Manual `workflow_dispatch` only | Builds the Release distribution, checks DLL loading, the remote loader and the launcher window, then uploads the binaries |
+| [Release](.github/workflows/release.yml) | Push of a `v*` tag matching the Cargo version | Runs checks and updater smoke tests, packages the EXE/DLL and manifest, then publishes a GitHub Release for the updater |
 
 To generate binaries, open **Actions > Build > Run workflow**, select the branch, and start the run. GitHub exposes this manual action once the workflow is present on the repository's default branch.
 

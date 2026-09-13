@@ -1,3 +1,4 @@
+use super::updater::{self, State as UpdateState, Updater};
 use super::{process::Handle, Worker};
 use crate::settings::Config;
 use std::{
@@ -7,6 +8,7 @@ use std::{
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
@@ -27,6 +29,9 @@ const FRIENDS: usize = 103;
 const LINK: usize = 104;
 const CLOSE: usize = 105;
 const STATUS: usize = 106;
+const UPDATE_CHECK: usize = 107;
+const UPDATE_INSTALL: usize = 108;
+const UPDATE_STATUS: usize = 109;
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
@@ -54,6 +59,12 @@ struct App {
     config_path: PathBuf,
     initial: Config,
     worker: Worker,
+    updater: RefCell<Updater>,
+    update_status: Cell<HWND>,
+    update_check: Cell<HWND>,
+    update_install: Cell<HWND>,
+    last_update_status: RefCell<String>,
+    restarting: Cell<bool>,
     error: RefCell<String>,
     last_status: RefCell<String>,
     name: Cell<HWND>,
@@ -102,7 +113,7 @@ impl App {
         let title = self.control(
             window,
             "STATIC",
-            "T7Patch 3.06 - Rust / Serious <3",
+            concat!("T7 Patch Rust v", env!("CARGO_PKG_VERSION")),
             0,
             [10, 7, 355, 24],
             SS_LEFT,
@@ -189,9 +200,37 @@ impl App {
             [10, 181, 389, 25],
             SS_NOTIFY | SS_LEFTNOWORDWRAP,
         ));
+        self.update_status.set(self.control(
+            window,
+            "STATIC",
+            "",
+            UPDATE_STATUS,
+            [10, 221, 389, 41],
+            SS_LEFT | SS_NOTIFY,
+        ));
+        self.update_check.set(self.control(
+            window,
+            "BUTTON",
+            "Check for updates",
+            UPDATE_CHECK,
+            [10, 273, 181, 25],
+            BS_PUSHBUTTON as u32 | WS_TABSTOP,
+        ));
+        self.update_install.set(self.control(
+            window,
+            "BUTTON",
+            "Update",
+            UPDATE_INSTALL,
+            [203, 273, 196, 25],
+            BS_PUSHBUTTON as u32 | WS_TABSTOP,
+        ));
+        if !self.smoke {
+            self.updater.borrow_mut().check();
+        }
         self.initialized.set(true);
         SetTimer(window, 1, 150, None);
         self.refresh();
+        self.refresh_update(window);
     }
     unsafe fn text(window: HWND) -> String {
         let length = GetWindowTextLengthW(window).clamp(0, 4096) as usize;
@@ -238,6 +277,102 @@ impl App {
             *self.last_status.borrow_mut() = text.clone();
             SetWindowTextW(self.status.get(), wide(&text).as_ptr());
             InvalidateRect(self.status.get(), null(), 1);
+        }
+    }
+
+    unsafe fn update_action(&self, window: HWND) {
+        if self.smoke {
+            return;
+        }
+        let state = self.updater.borrow().state();
+        match state {
+            UpdateState::Available(_) => self.updater.borrow_mut().download(),
+            UpdateState::Ready(update) => {
+                let game = super::process::find_game();
+                let error = match game {
+                    Ok(None) => None,
+                    Ok(Some(_)) => Some("Close BO3 before installing the update.".to_owned()),
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = error {
+                    MessageBoxW(
+                        window,
+                        wide(&error).as_ptr(),
+                        wide("T7 Patch update").as_ptr(),
+                        MB_OK,
+                    );
+                    return;
+                }
+                if self.dirty.get().is_some() {
+                    self.save();
+                }
+                if !self.error.borrow().is_empty() {
+                    MessageBoxW(
+                        window,
+                        wide("Save valid settings before restarting to update.").as_ptr(),
+                        wide("T7 Patch update").as_ptr(),
+                        MB_OK,
+                    );
+                    return;
+                }
+                self.worker.pause();
+                self.updater.borrow().set(UpdateState::Handoff(update));
+            }
+            _ => {}
+        }
+        self.refresh_update(window);
+    }
+
+    unsafe fn refresh_update(&self, window: HWND) {
+        let state = self.updater.borrow().state();
+        let text = state.text();
+        if *self.last_update_status.borrow() != text {
+            *self.last_update_status.borrow_mut() = text.clone();
+            SetWindowTextW(self.update_status.get(), wide(&text).as_ptr());
+        }
+        EnableWindow(
+            self.update_check.get(),
+            (!self.smoke && !state.busy() && !matches!(state, UpdateState::Ready(_))) as i32,
+        );
+        EnableWindow(
+            self.update_install.get(),
+            (!self.smoke && matches!(state, UpdateState::Available(_) | UpdateState::Ready(_)))
+                as i32,
+        );
+        SetWindowTextW(
+            self.update_install.get(),
+            wide(
+                if matches!(state, UpdateState::Ready(_) | UpdateState::Handoff(_)) {
+                    "Install & restart"
+                } else {
+                    "Download update"
+                },
+            )
+            .as_ptr(),
+        );
+        for control in [self.name.get(), self.password.get(), self.friends.get()] {
+            EnableWindow(control, (!matches!(state, UpdateState::Handoff(_))) as i32);
+        }
+        if let UpdateState::Handoff(update) = state {
+            if self.worker.is_quiescent() && !self.restarting.get() {
+                let directory = self.config_path.parent().expect("configuration directory");
+                match updater::install::start_helper(directory, &update.stage, false) {
+                    Ok(()) => {
+                        self.restarting.set(true);
+                        PostMessageW(window, WM_CLOSE, 0, 0);
+                    }
+                    Err(error) => {
+                        self.worker.resume();
+                        self.updater.borrow().set(UpdateState::Ready(update));
+                        MessageBoxW(
+                            window,
+                            wide(&error).as_ptr(),
+                            wide("T7 Patch update").as_ptr(),
+                            MB_OK | MB_ICONERROR,
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -292,6 +427,12 @@ unsafe extern "system" fn window_proc(
             };
             SetDCBrushColor(dc, 0x666666);
             FillRect(dc, &line, GetStockObject(DC_BRUSH) as HBRUSH);
+            let update_line = RECT {
+                top: app.px(212),
+                bottom: app.px(213),
+                ..line
+            };
+            FillRect(dc, &update_line, GetStockObject(DC_BRUSH) as HBRUSH);
             EndPaint(window, &paint);
             0
         }
@@ -352,6 +493,20 @@ unsafe extern "system" fn window_proc(
             }
             if notification == BN_CLICKED as u16 {
                 match id {
+                    UPDATE_CHECK => {
+                        app.updater.borrow_mut().check();
+                        app.refresh_update(window);
+                    }
+                    UPDATE_INSTALL => app.update_action(window),
+                    UPDATE_STATUS => {
+                        let text = app.updater.borrow().state().text();
+                        MessageBoxW(
+                            window,
+                            wide(&text).as_ptr(),
+                            wide("T7 Patch update").as_ptr(),
+                            MB_OK,
+                        );
+                    }
                     FRIENDS => app.save(),
                     CLOSE => {
                         SendMessageW(window, WM_CLOSE, 0, 0);
@@ -389,6 +544,7 @@ unsafe extern "system" fn window_proc(
                 app.save();
             }
             app.refresh();
+            app.refresh_update(window);
             if app.smoke && app.started.elapsed() >= Duration::from_secs(2) {
                 PostMessageW(window, WM_CLOSE, 0, 0);
             }
@@ -443,6 +599,9 @@ pub fn run(smoke: bool) -> Result<(), String> {
             .ok_or("Missing executable directory")?
             .to_owned();
         let path = directory.join("t7patch.conf");
+        if !smoke && updater::install::before_start(&directory)? {
+            return Ok(());
+        }
         let (config, error) = if smoke {
             (Config::default(), String::new())
         } else {
@@ -503,6 +662,12 @@ pub fn run(smoke: bool) -> Result<(), String> {
             config_path: path,
             initial: config,
             worker,
+            updater: RefCell::new(Updater::new(directory)),
+            update_status: Cell::new(null_mut()),
+            update_check: Cell::new(null_mut()),
+            update_install: Cell::new(null_mut()),
+            last_update_status: RefCell::new(String::new()),
+            restarting: Cell::new(false),
             error: RefCell::new(error),
             last_status: RefCell::new(String::new()),
             name: Cell::new(null_mut()),
@@ -529,7 +694,7 @@ pub fn run(smoke: bool) -> Result<(), String> {
             return Err(std::io::Error::last_os_error().to_string());
         }
         let width = app.px(410);
-        let height = app.px(214);
+        let height = app.px(310);
         let window = CreateWindowExW(
             WS_EX_APPWINDOW | WS_EX_CONTROLPARENT,
             class_name.as_ptr(),
@@ -552,6 +717,9 @@ pub fn run(smoke: bool) -> Result<(), String> {
             app.password.get(),
             app.friends.get(),
             app.status.get(),
+            app.update_status.get(),
+            app.update_check.get(),
+            app.update_install.get(),
         ]
         .iter()
         .any(|w| w.is_null())

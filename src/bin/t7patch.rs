@@ -10,10 +10,28 @@ mod launcher_api;
 mod settings;
 
 fn main() {
-    let smoke = std::env::args().any(|arg| arg == "--ui-smoke-test");
-    if let Err(error) = launcher::run(smoke) {
-        if smoke {
-            eprintln!("UI smoke test failed: {error}");
+    let args: Vec<_> = std::env::args_os().collect();
+    let smoke = args.iter().any(|arg| arg == "--ui-smoke-test");
+    let verifying = args
+        .get(1)
+        .is_some_and(|arg| arg == "--verify-update-package");
+    let result = if verifying {
+        if args.len() == 3 {
+            launcher::updater::verify_package(std::path::Path::new(&args[2]))
+        } else {
+            Err("Usage: t7patch.exe --verify-update-package <directory>".into())
+        }
+    } else if args
+        .get(1)
+        .is_some_and(|arg| arg == "--apply-update" || arg == "--recover-update")
+    {
+        launcher::updater::install::helper(&args)
+    } else {
+        launcher::run(smoke)
+    };
+    if let Err(error) = result {
+        if smoke || verifying {
+            eprintln!("Launcher check failed: {error}");
             std::process::exit(1);
         }
         let text: Vec<_> = error.encode_utf16().chain(Some(0)).collect();

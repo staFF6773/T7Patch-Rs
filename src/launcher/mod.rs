@@ -1,5 +1,6 @@
 pub mod process;
 mod ui;
+pub mod updater;
 
 use std::{
     path::PathBuf,
@@ -20,6 +21,8 @@ pub struct Worker {
     pub status: Arc<Mutex<Status>>,
     pub configured: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    quiescent: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 impl Worker {
@@ -34,11 +37,15 @@ impl Worker {
             active: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let quiescent = Arc::new(AtomicBool::new(!enabled));
         let configured = Arc::new(AtomicBool::new(configured));
         let thread = if enabled {
             let status = status.clone();
             let stop = stop.clone();
             let configured = configured.clone();
+            let paused = paused.clone();
+            let quiescent = quiescent.clone();
             Some(
                 std::thread::Builder::new()
                     .name("t7patch-loader".into())
@@ -46,6 +53,12 @@ impl Worker {
                         let mut session: Option<process::Session> = None;
                         let mut next_scan = std::time::Instant::now();
                         while !stop.load(Ordering::Acquire) {
+                            if paused.load(Ordering::Acquire) {
+                                quiescent.store(true, Ordering::Release);
+                                std::thread::sleep(Duration::from_millis(100));
+                                continue;
+                            }
+                            quiescent.store(false, Ordering::Release);
                             if session.as_ref().is_some_and(|s| !s.alive()) {
                                 session = None;
                             }
@@ -107,9 +120,21 @@ impl Worker {
         Ok(Self {
             status,
             stop,
+            paused,
+            quiescent,
             configured,
             thread,
         })
+    }
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+    pub fn resume(&self) {
+        self.quiescent.store(false, Ordering::Release);
+        self.paused.store(false, Ordering::Release);
+    }
+    pub fn is_quiescent(&self) -> bool {
+        self.quiescent.load(Ordering::Acquire)
     }
 }
 impl Drop for Worker {
