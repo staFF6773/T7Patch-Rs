@@ -1,5 +1,7 @@
 # T7 Patch — Rust Port
 
+[![CI](https://github.com/staFF6773/T7Patch-Rs/actions/workflows/ci.yml/badge.svg)](https://github.com/staFF6773/T7Patch-Rs/actions/workflows/ci.yml)
+
 A Rust desktop launcher and DLL for **64-bit Black Ops III / T7**. The launcher lets you change your player name, network password, and friends-only setting, then detects the game and activates the patch automatically. MinHook remains a native C dependency, accessed through FFI and managed by Cargo.
 
 **Status: experimental.** The Windows UI and loading mechanism have been checked locally, including remote loading into a dedicated test process. Full operation inside BO3 and compatibility with Wine/Proton still require runtime validation.
@@ -208,6 +210,23 @@ As in the original, integrity patches remain until process exit after a successf
 `SPOOF_UNLOCK_ALL` and `SPOOF_SKIP_CWL` were disabled in the supplied project. This port retains that behavior and omits hooks that only forwarded those calls unchanged. Script-name cache hooks that were commented out in the original `ApplyHooks` are also left disabled; the menu-response path validates its indices.
 
 ## Validation
+
+### GitHub Actions
+
+Two independent workflows use Windows Server 2022 with the stable Rust toolchain and the x64 MSVC target:
+
+| Workflow | Trigger | What it does |
+| --- | --- | --- |
+| [CI](.github/workflows/ci.yml) | Every push to a branch and every pull request | Checks formatting, Clippy with warnings denied, all-target tests, and documentation tests |
+| [Build](.github/workflows/build.yml) | Manual `workflow_dispatch` only | Builds the Release distribution, checks DLL loading, the remote loader and the launcher window, then uploads the binaries |
+
+To generate binaries, open **Actions > Build > Run workflow**, select the branch, and start the run. GitHub exposes this manual action once the workflow is present on the repository's default branch.
+
+After the manual build and its smoke tests pass, the run uploads **`t7patch-windows-x64`**, containing `t7patch.exe` and `t7patch.dll`. Download it from the successful run's **Artifacts** section within 14 days. These are build artifacts, not GitHub Releases.
+
+CI validates the Windows build and test harnesses. In-game behavior and Wine/Proton compatibility still require the runtime checks described in [Port Validation](docs/VALIDATION.md).
+
+### Local checks
 
 Run on Windows from the repository root:
 

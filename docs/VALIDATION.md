@@ -19,6 +19,36 @@ The implementation was checked on Windows x64 with Rust/Cargo 1.98.1 and MSVC:
 
 These results describe the implementation checks, not successful in-game validation. Platform setup instructions are in the [README](../README.md#windows-setup).
 
+## Continuous integration
+
+The workflows use GitHub-hosted `windows-2022` runners and stable Rust with `x86_64-pc-windows-msvc`. The runner supplies the Visual Studio tools and Windows SDK needed to build MinHook.
+
+### Automatic checks
+
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs on pushes to any branch and on pull requests. It installs `rustfmt` and Clippy, then runs:
+
+1. `cargo fmt -- --check`.
+2. Clippy for all targets with `-D warnings`.
+3. All-target tests and a separate documentation-test run.
+
+Superseded check runs for the same branch or pull request are cancelled. Compiling code as part of Clippy and tests does not generate a Release distribution artifact.
+
+### Manual builds
+
+[`.github/workflows/build.yml`](../.github/workflows/build.yml) has only a `workflow_dispatch` trigger. Start it using **Actions > Build > Run workflow** and choose the branch. The workflow must be present on the default branch for GitHub to expose that button.
+
+The manual workflow runs:
+
+1. Release packaging through `scripts/build.ps1` and compilation of the smoke-test examples.
+2. The original DLL API smoke test against the packaged DLL.
+3. Remote loading and bootstrap replies in the dedicated `launcher_host.exe` process.
+4. Launcher creation and shutdown using `--ui-smoke-test`, with a 30-second process timeout.
+5. Artifact upload after all build and smoke-test steps succeed.
+
+The artifact is named `t7patch-windows-x64`, contains the packaged EXE and DLL, and is retained for 14 days. Both workflows use read-only repository permissions and cache Rust dependencies. The manual build runs independently of the automatic check workflow.
+
+The UI lifecycle check does not capture the desktop or start game detection. Screenshot inspection remains a local check. CI does not launch BO3 or validate Wine/Proton, and a successful run does not establish that the in-game patch works.
+
 ## Automated checks
 
 - PE fingerprints for both builds and RVA translation boundaries.
