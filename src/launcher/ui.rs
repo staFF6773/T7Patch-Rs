@@ -35,6 +35,10 @@ const CLASS: &str = "T7PatchRustLauncher";
 #[repr(align(4))]
 struct IconImage([u8; include_bytes!("../../assets/t7patch-icon.png").len()]);
 static ICON_IMAGE: IconImage = IconImage(*include_bytes!("../../assets/t7patch-icon.png"));
+#[repr(align(4))]
+struct AvatarImage([u8; include_bytes!("../../assets/staff6773-avatar.png").len()]);
+static AVATAR_IMAGE: AvatarImage =
+    AvatarImage(*include_bytes!("../../assets/staff6773-avatar.png"));
 // COLORREF uses 0x00BBGGRR, unlike the RGB notation used by design tools.
 const ACCENT: u32 = 0x003c72ce;
 const DARK: u32 = 0x00191715;
@@ -126,6 +130,7 @@ struct Resources {
     mono_font: HFONT,
     icon: HICON,
     small_icon: HICON,
+    author_avatar: HICON,
 }
 impl Drop for Resources {
     fn drop(&mut self) {
@@ -144,7 +149,7 @@ impl Drop for Resources {
                     DeleteObject(object);
                 }
             }
-            for icon in [self.icon, self.small_icon] {
+            for icon in [self.icon, self.small_icon, self.author_avatar] {
                 if !icon.is_null() {
                     DestroyIcon(icon);
                 }
@@ -542,12 +547,12 @@ impl App {
         );
         self.button(window, "Source ↗", SOURCE_LINK, [424, 372, 82, 30]);
         self.button(window, "Related ↗", RELATED_LINK, [514, 372, 82, 30]);
-        self.label(window, "T7Patch-Rs", LABEL, [44, 414, 370, 21]);
+        self.label(window, "staFF6773 · T7Patch-Rs", LABEL, [100, 414, 316, 21]);
         self.label(
             window,
-            "Launcher and patch reimplementation in Rust.",
+            "Rust launcher and patch development.",
             HINT,
-            [44, 436, 370, 18],
+            [100, 436, 316, 18],
         );
         self.button(window, "Rust project  ↗", RUST_LINK, [440, 418, 156, 30]);
         self.label(window, "MinHook · Tsuda Kageyu", LABEL, [44, 460, 370, 21]);
@@ -977,6 +982,19 @@ unsafe extern "system" fn window_proc(
                 let x = if phase <= 452 { phase } else { 904 - phase };
                 app.fill(dc, &app.rect([44 + x, 412, 100, 3]), ACCENT);
             }
+            if app.page.get() == Page::Credits {
+                DrawIconEx(
+                    dc,
+                    app.px(44),
+                    app.px(411),
+                    app.resources.author_avatar,
+                    app.px(44),
+                    app.px(44),
+                    0,
+                    null_mut(),
+                    DI_NORMAL,
+                );
+            }
             EndPaint(window, &paint);
             0
         }
@@ -1341,6 +1359,15 @@ pub fn run(smoke: bool) -> Result<(), String> {
             mono_font: font(12.0, FW_NORMAL, "Consolas"),
             icon: icon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON)),
             small_icon: icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)),
+            author_avatar: CreateIconFromResourceEx(
+                AVATAR_IMAGE.0.as_ptr(),
+                AVATAR_IMAGE.0.len() as u32,
+                1,
+                0x00030000,
+                (44.0 * scale).round() as i32,
+                (44.0 * scale).round() as i32,
+                LR_DEFAULTCOLOR,
+            ),
         };
         if resources.background.is_null()
             || resources.border.is_null()
@@ -1352,6 +1379,7 @@ pub fn run(smoke: bool) -> Result<(), String> {
             || resources.mono_font.is_null()
             || resources.icon.is_null()
             || resources.small_icon.is_null()
+            || resources.author_avatar.is_null()
         {
             return Err("Cannot create window drawing resources".into());
         }
