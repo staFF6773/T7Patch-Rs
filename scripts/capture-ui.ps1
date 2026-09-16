@@ -2,7 +2,7 @@
 param(
     [string]$Executable = '',
     [string]$Output = '',
-    [ValidateSet('Settings', 'Updates', 'Credits')][string]$Tab = 'Settings'
+    [ValidateSet('Settings', 'Protection', 'Updates', 'Credits')][string]$Tab = 'Settings'
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -38,10 +38,10 @@ try {
     if ($process.MainWindowHandle -eq [IntPtr]::Zero) { throw 'Launcher window not found.' }
     $tabControl = [T7WindowCapture]::GetDlgItem($process.MainWindowHandle, 114)
     if ($tabControl -eq [IntPtr]::Zero) { throw 'Launcher tabs not found.' }
-    $index = @('Settings', 'Updates', 'Credits').IndexOf($Tab)
+    $index = @('Settings', 'Protection', 'Updates', 'Credits').IndexOf($Tab)
     $tabRect = New-Object T7WindowCapture+Rect
     if (-not [T7WindowCapture]::GetClientRect($tabControl, [ref]$tabRect)) { throw 'GetClientRect failed.' }
-    $x = [int](($index + 0.5) * $tabRect.Right / 3)
+    $x = [int](($index + 0.5) * $tabRect.Right / 4)
     $y = [int]($tabRect.Bottom / 2)
     $point = [IntPtr]($x -bor ($y -shl 16))
     [T7WindowCapture]::SendMessageW($tabControl, 0x0201, [IntPtr]1, $point) | Out-Null

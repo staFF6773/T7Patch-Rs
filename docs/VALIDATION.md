@@ -52,6 +52,18 @@ The UI lifecycle check does not capture the desktop or start game detection. Scr
 
 ## Automated checks
 
+### Protection history
+
+The history reader tests cover category separation, observe-only diagnostics, exclusion of raw journal fields from the summary view, malformed counts, partial lines, the 200-entry limit, the 256 KiB read limit, append, truncation and replacement. File reading runs in a dedicated launcher thread; the UI uses its in-memory snapshot.
+
+The four-tab Windows smoke check passed with sample history: all filter states, counters, hidden-control navigation, retained settings edits and clean shutdown. `--ui-smoke-test` uses explicitly labeled sample entries and disables journal reading/opening. The Protection screenshot was reviewed using:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\capture-ui.ps1 -Tab Protection
+```
+
+All-target tests (63 passed, 2 manual checks ignored), formatting, Clippy with warnings denied, Release distribution build and DLL loading smoke check passed for this change. New DLL journal entries include UTC timestamps; actual in-game event production and the shortened version label still require an in-game check.
+
 ### Updater checks
 
 The updater tests cover stable semantic-version ordering, missing/duplicate assets, invalid manifests, corrupted ZIPs, unexpected ZIP paths, cancellation, Windows x64 binary validation, preserving configuration, restoring the old EXE after a DLL replacement fails, and recovering an interrupted transaction. The locked-DLL regression holds a real Windows file handle that denies deletion. A corrupted backup is rejected before either file is restored. Network requests are disabled in normal tests and in `--ui-smoke-test`.

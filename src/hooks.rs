@@ -31,12 +31,7 @@ macro_rules! hook {
 }
 
 pub const WINDOW_TEXT: &[u8] = b"Call of Duty: Black Ops III (community patch by serious)\0";
-const VERSION: &[u8] = concat!(
-    "T7 Patch Rust v",
-    env!("CARGO_PKG_VERSION"),
-    " (experimental)"
-)
-.as_bytes();
+const VERSION: &[u8] = concat!("T7 Patch Rust v", env!("CARGO_PKG_VERSION")).as_bytes();
 
 extern "C" {
     fn __report_gsfailure(cookie: usize);

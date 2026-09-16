@@ -1,3 +1,4 @@
+use super::history::{Filter, History};
 use super::updater::{self, State as UpdateState, Updater};
 use super::{process::Handle, Worker};
 use crate::settings::Config;
@@ -64,6 +65,11 @@ const SOURCE_LINK: usize = 115;
 const RELATED_LINK: usize = 116;
 const RUST_LINK: usize = 117;
 const MINHOOK_LINK: usize = 118;
+const HISTORY_TEXT: usize = 130;
+const HISTORY_FILTER: usize = 131;
+const HISTORY_OPEN: usize = 132;
+const HISTORY_SUMMARY: usize = 133;
+const HISTORY_NOTICE: usize = 134;
 const LABEL: usize = 120;
 const HINT: usize = 121;
 const HEADING: usize = 122;
@@ -73,15 +79,22 @@ const PROGRESS: [i32; 4] = [44, 412, 552, 3];
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Settings,
+    Protection,
     Updates,
     Credits,
 }
 impl Page {
-    const ALL: [Self; 3] = [Self::Settings, Self::Updates, Self::Credits];
+    const ALL: [Self; 4] = [
+        Self::Settings,
+        Self::Protection,
+        Self::Updates,
+        Self::Credits,
+    ];
 
     fn title(self) -> &'static str {
         match self {
             Self::Settings => "Settings",
+            Self::Protection => "Protection",
             Self::Updates => "Updates",
             Self::Credits => "Credits",
         }
@@ -145,6 +158,12 @@ struct App {
     config_path: PathBuf,
     initial: Config,
     worker: Worker,
+    history: History,
+    history_filter: Cell<Filter>,
+    history_text: Cell<HWND>,
+    history_summary: Cell<HWND>,
+    history_notice: Cell<HWND>,
+    last_history_text: RefCell<String>,
     updater: RefCell<Updater>,
     update_status: Cell<HWND>,
     update_check: Cell<HWND>,
@@ -322,7 +341,7 @@ impl App {
             tabs,
             TCM_SETITEMSIZE,
             0,
-            (self.px(194) | (self.px(40) << 16)) as isize,
+            (self.px(146) | (self.px(40) << 16)) as isize,
         );
     }
     unsafe fn show_page(&self, window: HWND, page: Page) {
@@ -342,6 +361,9 @@ impl App {
         }
         InvalidateRect(self.tabs.get(), null(), 0);
         InvalidateRect(window, &self.rect(CONTENT), 0);
+        if page == Page::Protection {
+            self.refresh_history();
+        }
     }
     unsafe fn create_controls(&self, window: HWND) {
         self.label(window, "GAME CONNECTION", HEADING, [44, 112, 350, 20]);
@@ -420,6 +442,42 @@ impl App {
             HINT,
             [196, 477, 400, 20],
         );
+        self.creating_page.set(Some(Page::Protection));
+        self.label(window, "PROTECTION HISTORY", HEADING, [44, 280, 256, 20]);
+        self.button(window, "Filter: All", HISTORY_FILTER, [316, 276, 152, 28]);
+        self.button(window, "Open journal", HISTORY_OPEN, [476, 276, 120, 28]);
+        self.history_summary
+            .set(self.label(window, "", HISTORY_SUMMARY, [44, 313, 552, 20]));
+        self.history_notice
+            .set(self.label(window, "", HISTORY_NOTICE, [44, 337, 552, 18]));
+        self.history_text.set(self.control(
+            window,
+            "EDIT",
+            "No recorded events for this filter.",
+            HISTORY_TEXT,
+            [44, 364, 552, 136],
+            ES_MULTILINE as u32
+                | ES_READONLY as u32
+                | ES_AUTOVSCROLL as u32
+                | ES_AUTOHSCROLL as u32
+                | WS_VSCROLL
+                | WS_HSCROLL
+                | WS_TABSTOP,
+        ));
+        SendMessageW(self.history_text.get(), EM_SETLIMITTEXT, 65535, 0);
+        SendMessageW(
+            self.history_text.get(),
+            WM_SETFONT,
+            self.resources.small_font as usize,
+            1,
+        );
+        self.label(
+            window,
+            "Reports every 10s. Rejections do not necessarily mean attacks.",
+            HINT,
+            [44, 509, 552, 18],
+        );
+
         self.creating_page.set(Some(Page::Updates));
         self.label(window, "LAUNCHER UPDATES", HEADING, [44, 284, 350, 20]);
         self.label(
@@ -524,6 +582,31 @@ impl App {
         let mut text = vec![0u16; length + 1];
         let count = GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
         String::from_utf16_lossy(&text[..count])
+    }
+    unsafe fn refresh_history(&self) {
+        if self.page.get() != Page::Protection {
+            return;
+        }
+        let snapshot = self
+            .history
+            .snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        EnableWindow(
+            GetDlgItem(GetParent(self.history_text.get()), HISTORY_OPEN as i32),
+            snapshot.available as i32,
+        );
+        Self::set_text(self.history_summary.get(), &snapshot.summary());
+        Self::set_text(self.history_notice.get(), &snapshot.notice);
+        let text = snapshot.text(self.history_filter.get());
+        if *self.last_history_text.borrow() != text {
+            // Preserve the reader's scroll position across background refreshes.
+            let line = SendMessageW(self.history_text.get(), EM_GETFIRSTVISIBLELINE, 0, 0);
+            SetWindowTextW(self.history_text.get(), wide(&text).as_ptr());
+            SendMessageW(self.history_text.get(), EM_LINESCROLL, 0, line);
+            *self.last_history_text.borrow_mut() = text;
+        }
     }
     unsafe fn save(&self) {
         self.dirty.set(None);
@@ -908,11 +991,11 @@ unsafe extern "system" fn window_proc(
                     ERROR
                 }
                 HEADING => ACCENT,
-                HINT | SAVED => MUTED,
+                HINT | SAVED | HISTORY_NOTICE => MUTED,
                 _ => TEXT,
             };
             let (background, brush) = match id {
-                NAME | PASSWORD => (INPUT, app.resources.input),
+                NAME | PASSWORD | HISTORY_TEXT => (INPUT, app.resources.input),
                 _ => (PANEL, app.resources.panel),
             };
             SetTextColor(dc, color);
@@ -1047,6 +1130,33 @@ unsafe extern "system" fn window_proc(
             }
             if notification == BN_CLICKED as u16 {
                 match id {
+                    HISTORY_FILTER => {
+                        let filter = app.history_filter.get().next();
+                        app.history_filter.set(filter);
+                        App::set_text(
+                            GetDlgItem(window, HISTORY_FILTER as i32),
+                            &format!("Filter: {}", filter.title()),
+                        );
+                        app.refresh_history();
+                    }
+                    HISTORY_OPEN => {
+                        let result = ShellExecuteW(
+                            window,
+                            wide("open").as_ptr(),
+                            wide("notepad.exe").as_ptr(),
+                            wide(&format!("\"{}\"", app.history.path.display())).as_ptr(),
+                            null(),
+                            SW_SHOWNORMAL,
+                        );
+                        if result as isize <= 32 {
+                            MessageBoxW(
+                                window,
+                                wide("Could not open the protection journal.").as_ptr(),
+                                wide("Protection history").as_ptr(),
+                                MB_OK | MB_ICONERROR,
+                            );
+                        }
+                    }
                     UPDATE_CHECK => {
                         app.updater.borrow_mut().check();
                         app.refresh_update(window);
@@ -1102,6 +1212,7 @@ unsafe extern "system" fn window_proc(
             }
             app.refresh();
             app.refresh_update(window);
+            app.refresh_history();
             if app.smoke && app.started.elapsed() >= Duration::from_secs(2) {
                 PostMessageW(window, WM_CLOSE, 0, 0);
             }
@@ -1252,6 +1363,13 @@ pub fn run(smoke: bool) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
         let app = Box::new(App {
+            history: History::start(path.with_file_name("t7patch-events.log"), !smoke)
+                .map_err(|e| e.to_string())?,
+            history_filter: Cell::new(Filter::All),
+            history_text: Cell::new(null_mut()),
+            history_summary: Cell::new(null_mut()),
+            history_notice: Cell::new(null_mut()),
+            last_history_text: RefCell::new(String::new()),
             resources,
             scale,
             config_path: path,

@@ -1,3 +1,4 @@
+mod history;
 pub mod process;
 mod ui;
 pub mod updater;

@@ -68,11 +68,19 @@ pub fn event(message: fmt::Arguments<'_>) {
         len: 0,
     };
     unsafe {
+        let mut utc = std::mem::zeroed();
+        windows_sys::Win32::System::SystemInformation::GetSystemTime(&mut utc);
         let _ = writeln!(
             line,
-            "tick={} thread={} {message}",
+            "tick={} thread={} utc={:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z {message}",
             windows_sys::Win32::System::SystemInformation::GetTickCount64(),
-            windows_sys::Win32::System::Threading::GetCurrentThreadId()
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            utc.wYear,
+            utc.wMonth,
+            utc.wDay,
+            utc.wHour,
+            utc.wMinute,
+            utc.wSecond
         );
     }
     // No heap formatting, path lookup, or Rust mutex in an exception callback.

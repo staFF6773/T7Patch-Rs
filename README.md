@@ -40,7 +40,7 @@ The launcher rechecks process identity through its open handle and tracks that h
 
 Closing the launcher leaves an already installed patch active in the game. Reopening it recognizes the loaded DLL. A permanent installation failure or explicit deactivation requires restarting BO3; a game that is still initializing is retried automatically.
 
-The launcher has its own Rust-inspired charcoal and oxide-orange theme. **Settings**, **Updates**, and **Credits** tabs keep the interface compact, with game connection status always visible above them. Use the arrow keys while the tab strip is focused, or **Ctrl+Tab / Ctrl+Shift+Tab** from any tab, to switch sections. Hidden controls are excluded from keyboard navigation, and game detection and updates continue in the background. Native controls support visible focus and system DPI scaling. The header includes minimize and close controls; drag its empty area to move the window. **Credits** acknowledges Serious / shiversoftdev, Scroptss, T7Patch-Rs, and MinHook with links to their projects and references.
+The launcher has its own Rust-inspired charcoal and oxide-orange theme. **Settings**, **Protection**, **Updates**, and **Credits** tabs keep the interface compact, with game connection status always visible above them. Use the arrow keys while the tab strip is focused, or **Ctrl+Tab / Ctrl+Shift+Tab** from any tab, to switch sections. Hidden controls are excluded from keyboard navigation, and game detection and updates continue in the background. Native controls support visible focus and system DPI scaling. The header includes minimize and close controls; drag its empty area to move the window. **Credits** acknowledges Serious / shiversoftdev, Scroptss, T7Patch-Rs, and MinHook with links to their projects and references.
 
 ## Network protection and frame-time stability
 
@@ -54,6 +54,14 @@ The shared protection layer is enabled in **Campaign, Multiplayer and Zombies**,
 If the previous `control-v1` build stopped at a black screen during startup, restart BO3 and the launcher after rebuilding. The corrected build identifies itself in the event journal with **`network_guard=control-v2 connectionless_reader=observe-v1`**. See [startup regression diagnostics](docs/VALIDATION.md#startup-black-screen-after-control-v1).
 
 These changes target avoidable work and malformed control traffic, not a guaranteed FPS increase or complete coverage of BO3 vulnerabilities. **In-game compatibility and frame-time gains still require measurement in each mode**, especially joins, co-op, host migration and map changes. The limits do not authenticate an address/XUID or prevent Internet-link saturation. See [control-traffic budgets and validation](docs/VALIDATION.md#control-traffic-protection) and [performance diagnostics](docs/VALIDATION.md#performance-diagnostics).
+
+## Protection history
+
+The launcher's **Protection** tab shows recent recorded rejections, rate-limit events and diagnostics from `t7patch-events.log` beside the launcher. **Filter** cycles through All, Rejected, Rate limits and Diagnostics; **Open journal** opens the full file in Notepad.
+
+The DLL reports nonzero protection counters at most once every ten seconds. A separate launcher worker refreshes the view every two seconds, reading at most the last **256 KiB** and retaining **200 category entries**, newest first. Totals describe that retained window, across recorded sessions, rather than lifetime totals or unique attacks. Friend-refresh failures and observe-only reader diagnostics are shown separately from rejections. Only existing instrumented checks contribute to the counters; this is not a complete audit of every blocked action.
+
+New journal records include UTC timestamps. Older records show time since Windows boot (`Boot +HH:MM:SS`), which is not comparable across restarts. The view handles partial writes and journal truncation/replacement. If the DLL has to use its documented TEMP fallback because the installation folder is unwritable, that fallback file is not included in this view.
 
 ## Launcher updates
 
